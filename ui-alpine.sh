@@ -121,7 +121,7 @@ update_menu() {
         return 0
     fi
 
-    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/x-ui-alpine.sh"
+    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
     chmod +x /usr/bin/x-ui
 
     if [[ $? == 0 ]]; then
@@ -447,7 +447,7 @@ enable_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/x-ui -N --no-check-certificate "${repo_raw_base}/x-ui-alpine.sh"
+    wget -O /usr/bin/x-ui -N --no-check-certificate "${repo_raw_base}/ui-alpine.sh"
     if [[ $? != 0 ]]; then
         echo ""
         LOGE "下载脚本失败, 请检查机器是否可以连接Github"

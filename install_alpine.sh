@@ -185,9 +185,9 @@ install_x-ui() {
     fi
 
     chmod +x x-ui/x-ui "x-ui/bin/${xray_binary}"
-    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/x-ui-alpine.sh"
+    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
     chmod +x /usr/bin/x-ui
-    wget --no-check-certificate -O /etc/init.d/x-ui "${repo_raw_base}/x-ui.rc"
+    wget --no-check-certificate -O /etc/init.d/x-ui "${repo_raw_base}/ui.rc"
     chmod +x /etc/init.d/x-ui
     config_after_install
     export XRAY_VMESS_AEAD_FORCED="false"
