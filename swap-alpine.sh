@@ -355,8 +355,15 @@ rewrite_fstab_swap_entry() {
 
 create_swap_file() {
     local target_mb="$1"
+    local create_mode="${2:-auto}"
 
     mkdir -p "$(dirname "${managed_swap_file}")"
+
+    if [[ "${create_mode}" == "dd" ]]; then
+        LOGD "正在使用 dd 方式重建 ${managed_swap_file}..."
+        dd if=/dev/zero of="${managed_swap_file}" bs=1M count="${target_mb}" >/dev/null 2>&1
+        return $?
+    fi
 
     if command -v fallocate >/dev/null 2>&1; then
         if fallocate -l "${target_mb}M" "${managed_swap_file}" 2>/dev/null; then
@@ -369,24 +376,66 @@ create_swap_file() {
     dd if=/dev/zero of="${managed_swap_file}" bs=1M count="${target_mb}" >/dev/null 2>&1
 }
 
+read_error_message() {
+    local stderr_file="$1"
+    tr '\n' ' ' < "${stderr_file}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
+}
+
+is_holes_error_message() {
+    local error_message="$1"
+    local normalized_message=""
+
+    normalized_message=$(printf '%s' "${error_message}" | tr '[:upper:]' '[:lower:]')
+    [[ "${normalized_message}" == *"file has holes"* || "${normalized_message}" == *"swapfile has holes"* ]]
+}
+
+prepare_swap_file() {
+    local target_mb="$1"
+    local create_mode="${2:-auto}"
+
+    rm -f "${managed_swap_file}"
+
+    if ! create_swap_file "${target_mb}" "${create_mode}"; then
+        LOGE "创建 ${managed_swap_file} 失败"
+        return 1
+    fi
+
+    chmod 600 "${managed_swap_file}" || {
+        LOGE "设置 ${managed_swap_file} 权限失败"
+        return 1
+    }
+
+    mkswap "${managed_swap_file}" >/dev/null 2>&1 || {
+        LOGE "执行 mkswap 失败"
+        return 1
+    }
+
+    return 0
+}
+
 handle_swapon_failure() {
     local stderr_file="$1"
+    local retry_note="${2:-}"
     local error_message=""
     local normalized_message=""
 
-    error_message=$(tr '\n' ' ' < "${stderr_file}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    error_message=$(read_error_message "${stderr_file}")
     [[ -z "${error_message}" ]] && error_message="未知错误"
     normalized_message=$(printf '%s' "${error_message}" | tr '[:upper:]' '[:lower:]')
 
     LOGE "系统报错: ${error_message}"
+    if [[ -n "${retry_note}" ]]; then
+        LOGE "${retry_note}"
+    fi
 
     case "${normalized_message}" in
         *"operation not permitted"* | *"permission denied"* | *"function not implemented"* | *"not supported"*)
             LOGE "中文说明: 当前系统环境可能不支持新增 swapfile，或 swapon 被宿主/容器策略限制"
             LOGE "处理建议: 这通常不是输入大小问题，请改为在宿主机或控制面板层面开启 swap，或更换到支持 swapon 的环境后再试"
             ;;
-        *"invalid argument"* | *"swapfile has holes"* | *"read swap header failed"*)
-            LOGE "中文说明: 当前 swap 文件或所在文件系统不满足启用要求，请改用支持 swapfile 的文件系统，或让脚本回退到 dd 方式后重试"
+        *"invalid argument"* | *"swapfile has holes"* | *"file has holes"* | *"read swap header failed"*)
+            LOGE "中文说明: 这是 swap 文件格式或所在文件系统的问题，不是单纯的环境不支持"
+            LOGE "处理建议: 如果脚本已经自动改用 dd 重建后仍失败，通常说明当前文件系统不适合 swapfile"
             ;;
         *"already in use"* | *"device or resource busy"*)
             LOGE "中文说明: 该 swap 文件已启用或正在被占用，请先检查当前 swap 状态"
@@ -408,6 +457,7 @@ handle_swapon_failure() {
 apply_target_swap_size() {
     local target_mb="$1"
     local swapon_stderr_file=""
+    local swapon_error_message=""
 
     if (( target_mb <= 0 )); then
         LOGE "目标大小必须大于 0"
@@ -422,25 +472,32 @@ apply_target_swap_size() {
         fi
     fi
 
-    rm -f "${managed_swap_file}"
-
-    if ! create_swap_file "${target_mb}"; then
-        LOGE "创建 ${managed_swap_file} 失败"
+    if ! prepare_swap_file "${target_mb}" "auto"; then
         return 1
     fi
 
-    chmod 600 "${managed_swap_file}" || {
-        LOGE "设置 ${managed_swap_file} 权限失败"
-        return 1
-    }
-
-    mkswap "${managed_swap_file}" >/dev/null 2>&1 || {
-        LOGE "执行 mkswap 失败"
-        return 1
-    }
-
     swapon_stderr_file=$(mktemp)
     swapon "${managed_swap_file}" 2> "${swapon_stderr_file}" || {
+        swapon_error_message=$(read_error_message "${swapon_stderr_file}")
+        if is_holes_error_message "${swapon_error_message}"; then
+            LOGD "检测到 ${managed_swap_file} 存在 holes，正在自动改用 dd 重建并重试..."
+            rm -f "${swapon_stderr_file}"
+            if ! prepare_swap_file "${target_mb}" "dd"; then
+                return 1
+            fi
+
+            swapon_stderr_file=$(mktemp)
+            swapon "${managed_swap_file}" 2> "${swapon_stderr_file}" || {
+                handle_swapon_failure "${swapon_stderr_file}" "脚本已自动改用 dd 重建后再次尝试，但仍然失败"
+                rm -f "${swapon_stderr_file}"
+                return 1
+            }
+            rm -f "${swapon_stderr_file}"
+            rewrite_fstab_swap_entry "yes"
+            LOGI "已将 ${managed_swap_file} 调整为 $(format_mb "${target_mb}")，并自动改用 dd 方式启用成功，重启后仍然生效"
+            return 0
+        fi
+
         handle_swapon_failure "${swapon_stderr_file}"
         rm -f "${swapon_stderr_file}"
         return 1
