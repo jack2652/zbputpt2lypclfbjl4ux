@@ -33,7 +33,7 @@ show_usage() {
   1. 提供查看当前虚拟内存、增加虚拟内存、减少虚拟内存、退出四项菜单
   2. 默认自动识别单个现有 swap 文件；未识别到时默认管理 /swapfile
   3. 增加和减少会同步维护 /etc/fstab，重启后仍然生效
-  4. 如果系统同时启用了多个 swap 设备，脚本只允许查看，不允许直接调整
+  4. 允许与宿主提供的 virtual swap 共存；如果存在其他 file/partition swap，则只允许查看
 EOF
 }
 
@@ -205,8 +205,12 @@ has_active_managed_swap() {
     awk -v target="${managed_swap_file}" 'NR > 1 && $1 == target {found=1} END {exit !found}' /proc/swaps
 }
 
-has_unmanaged_active_swap() {
-    awk -v target="${managed_swap_file}" 'NR > 1 && $1 != target {found=1} END {exit !found}' /proc/swaps
+has_virtual_active_swap() {
+    awk 'NR > 1 && $2 == "virtual" {found=1} END {exit !found}' /proc/swaps
+}
+
+has_conflicting_active_swap() {
+    awk -v target="${managed_swap_file}" 'NR > 1 && $1 != target && $2 != "virtual" {found=1} END {exit !found}' /proc/swaps
 }
 
 is_swap_persistent() {
@@ -214,11 +218,21 @@ is_swap_persistent() {
 }
 
 swap_changes_allowed() {
-    if has_unmanaged_active_swap; then
+    if has_conflicting_active_swap; then
         return 1
     fi
 
     return 0
+}
+
+show_swap_change_status() {
+    if has_conflicting_active_swap; then
+        echo -e "  调整状态: ${yellow}检测到其他 file/partition swap, 当前仅允许查看${plain}"
+    elif has_virtual_active_swap; then
+        echo -e "  调整状态: ${green}可调整${plain} ${yellow}(将与宿主提供的 virtual swap 共存)${plain}"
+    else
+        echo -e "  调整状态: ${green}可调整${plain}"
+    fi
 }
 
 parse_size_to_mb() {
@@ -277,11 +291,7 @@ show_status_summary() {
     echo -e "  已用Swap: ${green}$(format_mb "${used_swap_mb}")${plain}"
     echo -e "  剩余Swap: ${green}$(format_mb "${free_swap_mb}")${plain}"
     echo -e "  文件大小: ${green}$(format_mb "${current_file_mb}")${plain}"
-    if swap_changes_allowed; then
-        echo -e "  调整状态: ${green}可调整${plain}"
-    else
-        echo -e "  调整状态: ${yellow}检测到其他活动 swap 设备, 当前仅允许查看${plain}"
-    fi
+    show_swap_change_status
 }
 
 show_current_swap() {
@@ -322,8 +332,10 @@ show_current_swap() {
     echo "当前活动 swap 列表:"
     cat /proc/swaps
     echo
-    if ! swap_changes_allowed; then
-        LOGD "检测到除 ${managed_swap_file} 之外还有其他活动 swap 设备, 本脚本当前只允许查看"
+    if has_conflicting_active_swap; then
+        LOGD "检测到除 ${managed_swap_file} 之外还有其他 file/partition swap, 本脚本当前只允许查看"
+    elif has_virtual_active_swap; then
+        LOGD "检测到宿主提供的 virtual swap，本脚本允许在其基础上额外创建或调整 ${managed_swap_file}"
     fi
     pause_return
 }
@@ -357,8 +369,45 @@ create_swap_file() {
     dd if=/dev/zero of="${managed_swap_file}" bs=1M count="${target_mb}" >/dev/null 2>&1
 }
 
+handle_swapon_failure() {
+    local stderr_file="$1"
+    local error_message=""
+    local normalized_message=""
+
+    error_message=$(tr '\n' ' ' < "${stderr_file}" | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    [[ -z "${error_message}" ]] && error_message="未知错误"
+    normalized_message=$(printf '%s' "${error_message}" | tr '[:upper:]' '[:lower:]')
+
+    LOGE "系统报错: ${error_message}"
+
+    case "${normalized_message}" in
+        *"operation not permitted"* | *"permission denied"* | *"function not implemented"* | *"not supported"*)
+            LOGE "中文说明: 当前系统环境可能不支持新增 swapfile，或 swapon 被宿主/容器策略限制"
+            LOGE "处理建议: 这通常不是输入大小问题，请改为在宿主机或控制面板层面开启 swap，或更换到支持 swapon 的环境后再试"
+            ;;
+        *"invalid argument"* | *"swapfile has holes"* | *"read swap header failed"*)
+            LOGE "中文说明: 当前 swap 文件或所在文件系统不满足启用要求，请改用支持 swapfile 的文件系统，或让脚本回退到 dd 方式后重试"
+            ;;
+        *"already in use"* | *"device or resource busy"*)
+            LOGE "中文说明: 该 swap 文件已启用或正在被占用，请先检查当前 swap 状态"
+            ;;
+        *"no such file or directory"*)
+            LOGE "中文说明: 目标 swap 文件不存在，可能在重建过程中被移除，请重新执行并观察创建步骤"
+            ;;
+        *"cannot allocate memory"* | *"cannot allocate"* | *"enomem"*)
+            LOGE "中文说明: 当前内存状态不足以完成 swapon，请先释放内存或降低目标大小后再试"
+            ;;
+        *)
+            LOGE "中文说明: 启用 swapfile 失败，当前无法确定是否为环境限制，请结合上面的系统原始报错继续排查"
+            ;;
+    esac
+
+    LOGE "补充提醒: 如果这是调整现有 swap 的过程中失败，请立即重新查看当前 Swap 状态"
+}
+
 apply_target_swap_size() {
     local target_mb="$1"
+    local swapon_stderr_file=""
 
     if (( target_mb <= 0 )); then
         LOGE "目标大小必须大于 0"
@@ -390,10 +439,13 @@ apply_target_swap_size() {
         return 1
     }
 
-    swapon "${managed_swap_file}" || {
-        LOGE "启用 ${managed_swap_file} 失败"
+    swapon_stderr_file=$(mktemp)
+    swapon "${managed_swap_file}" 2> "${swapon_stderr_file}" || {
+        handle_swapon_failure "${swapon_stderr_file}"
+        rm -f "${swapon_stderr_file}"
         return 1
     }
+    rm -f "${swapon_stderr_file}"
 
     rewrite_fstab_swap_entry "yes"
     LOGI "已将 ${managed_swap_file} 调整为 $(format_mb "${target_mb}")，重启后仍然生效"
@@ -409,7 +461,7 @@ increase_swap() {
     local raw_input=""
 
     if ! swap_changes_allowed; then
-        LOGE "当前系统存在其他活动 swap 设备, 为避免误操作, 暂不允许直接增加"
+        LOGE "当前系统存在其他 file/partition swap, 为避免误操作, 暂不允许直接增加"
         pause_return
         return 1
     fi
@@ -477,7 +529,7 @@ reduce_swap() {
     local confirm_target_mb=""
 
     if ! swap_changes_allowed; then
-        LOGE "当前系统存在其他活动 swap 设备, 为避免误操作, 暂不允许直接减少"
+        LOGE "当前系统存在其他 file/partition swap, 为避免误操作, 暂不允许直接减少"
         pause_return
         return 1
     fi
