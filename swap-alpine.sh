@@ -6,6 +6,7 @@ yellow='\033[0;33m'
 plain='\033[0m'
 
 current_arch=""
+container_type=""
 managed_swap_file="${SWAP_FILE:-}"
 disk_reserve_mb=512
 swap_reduce_buffer_mb=512
@@ -34,6 +35,7 @@ show_usage() {
   2. 默认自动识别单个现有 swap 文件；未识别到时默认管理 /swapfile
   3. 增加和减少会同步维护 /etc/fstab，重启后仍然生效
   4. 允许与宿主提供的 virtual swap 共存；如果存在其他 file/partition swap，则只允许查看
+  5. 如果检测到当前为 LXC 容器，则仅保留查看功能，新增或调整 swapfile 请到宿主机配置
 EOF
 }
 
@@ -48,6 +50,31 @@ detect_arch() {
         aarch64 | arm64 | armv8 | armv8*) echo "arm64" ;;
         *) return 1 ;;
     esac
+}
+
+detect_container_type() {
+    local detected_type=""
+
+    if [[ -f /run/systemd/container ]]; then
+        detected_type=$(tr -d '[:space:]' < /run/systemd/container 2>/dev/null)
+        [[ -n "${detected_type}" ]] && echo "${detected_type}" && return 0
+    fi
+
+    if [[ -r /proc/1/environ ]]; then
+        detected_type=$(tr '\0' '\n' < /proc/1/environ | awk -F= '$1 == "container" {print $2; exit}')
+        [[ -n "${detected_type}" ]] && echo "${detected_type}" && return 0
+    fi
+
+    if [[ -r /proc/1/cgroup ]] && grep -qiE '(^|[[:space:]:/.-])lxc([[:space:]:/.-]|$)' /proc/1/cgroup; then
+        echo "lxc"
+        return 0
+    fi
+
+    echo ""
+}
+
+is_lxc_container() {
+    [[ "${container_type}" == "lxc" ]]
 }
 
 ensure_environment() {
@@ -74,6 +101,8 @@ ensure_environment() {
         LOGE "当前仅支持 amd64 和 arm64/aarch64 架构"
         exit 1
     fi
+
+    container_type=$(detect_container_type)
 
     [[ -f /etc/fstab ]] || touch /etc/fstab
 }
@@ -218,6 +247,10 @@ is_swap_persistent() {
 }
 
 swap_changes_allowed() {
+    if is_lxc_container; then
+        return 1
+    fi
+
     if has_conflicting_active_swap; then
         return 1
     fi
@@ -226,7 +259,9 @@ swap_changes_allowed() {
 }
 
 show_swap_change_status() {
-    if has_conflicting_active_swap; then
+    if is_lxc_container; then
+        echo -e "  调整状态: ${yellow}当前环境为 LXC 容器，仅允许查看，请到宿主机配置 swap${plain}"
+    elif has_conflicting_active_swap; then
         echo -e "  调整状态: ${yellow}检测到其他 file/partition swap, 当前仅允许查看${plain}"
     elif has_virtual_active_swap; then
         echo -e "  调整状态: ${green}可调整${plain} ${yellow}(将与宿主提供的 virtual swap 共存)${plain}"
@@ -332,7 +367,9 @@ show_current_swap() {
     echo "当前活动 swap 列表:"
     cat /proc/swaps
     echo
-    if has_conflicting_active_swap; then
+    if is_lxc_container; then
+        LOGD "检测到当前环境为 LXC 容器，容器内通常不支持新增或调整 swapfile，请到宿主机配置"
+    elif has_conflicting_active_swap; then
         LOGD "检测到除 ${managed_swap_file} 之外还有其他 file/partition swap, 本脚本当前只允许查看"
     elif has_virtual_active_swap; then
         LOGD "检测到宿主提供的 virtual swap，本脚本允许在其基础上额外创建或调整 ${managed_swap_file}"
@@ -517,6 +554,12 @@ increase_swap() {
     local future_disk_free_mb
     local raw_input=""
 
+    if is_lxc_container; then
+        LOGE "当前环境为 LXC 容器，容器内通常不支持新增 swapfile，请到宿主机配置"
+        pause_return
+        return 1
+    fi
+
     if ! swap_changes_allowed; then
         LOGE "当前系统存在其他 file/partition swap, 为避免误操作, 暂不允许直接增加"
         pause_return
@@ -584,6 +627,12 @@ reduce_swap() {
     local raw_input=""
     local confirm_input=""
     local confirm_target_mb=""
+
+    if is_lxc_container; then
+        LOGE "当前环境为 LXC 容器，容器内通常不支持调整 swapfile，请到宿主机配置"
+        pause_return
+        return 1
+    fi
 
     if ! swap_changes_allowed; then
         LOGE "当前系统存在其他 file/partition swap, 为避免误操作, 暂不允许直接减少"
@@ -684,7 +733,9 @@ show_menu() {
 }
 
 ensure_environment "$1"
-ensure_swap_tools
 detect_managed_swap_file
 validate_managed_swap_file
+if ! is_lxc_container; then
+    ensure_swap_tools
+fi
 show_menu
