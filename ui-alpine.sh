@@ -381,6 +381,10 @@ show_banlog() {
         before_show_menu
 }
 
+restart_xray() {
+    restart $1
+}
+
 bbr_menu() {
     echo -e "${green}\t1.${plain} 开启BBR"
     echo -e "${green}\t2.${plain} 关闭BBR"
@@ -537,7 +541,7 @@ show_enable_status() {
 
 check_xray_status() {
     count=$(ps -ef | grep "xray-linux" | grep -v "grep" | wc -l)
-    if [[ count -ne 0 ]]; then
+    if [[ $count -ne 0 ]]; then
         return 0
     else
         return 1
@@ -1025,6 +1029,7 @@ show_usage() {
     echo -e "x-ui start        - 启动服务"
     echo -e "x-ui stop         - 停止服务"
     echo -e "x-ui restart      - 重启服务"
+    echo -e "x-ui restart-xray - 重启xray服务"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 设置开机启动"
@@ -1060,22 +1065,23 @@ show_menu() {
   ${green}13.${plain} 重启服务
   ${green}14.${plain} 查看服务状态
   ${green}15.${plain} 查看日志
+  ${green}16.${plain} 重启xray服务
 ————————————————
-  ${green}16.${plain} 设置开机启动
-  ${green}17.${plain} 关闭开机启动
+  ${green}17.${plain} 设置开机启动
+  ${green}18.${plain} 关闭开机启动
 ————————————————
-  ${green}18.${plain} ACME证书管理
-  ${green}19.${plain} Cloudflare证书管理
-  ${green}20.${plain} IP限制管理
-  ${green}21.${plain} 防火墙管理
-  ${green}22.${plain} SSH端口转发管理
+  ${green}19.${plain} ACME证书管理
+  ${green}20.${plain} Cloudflare证书管理
+  ${green}21.${plain} IP限制管理
+  ${green}22.${plain} 防火墙管理
+  ${green}23.${plain} SSH端口转发管理
 ————————————————
-  ${green}23.${plain} BBR功能
-  ${green}24.${plain} 更新Geo文件
-  ${green}25.${plain} 速度测试(Ookla)
+  ${green}24.${plain} BBR功能
+  ${green}25.${plain} 更新Geo文件
+  ${green}26.${plain} 速度测试(Ookla)
 "
     show_status
-    echo && read -p "请输入选项[0-25]: " num
+    echo && read -p "请输入选项[0-26]: " num
 
     case "${num}" in
     0)
@@ -1127,37 +1133,40 @@ show_menu() {
         check_install && show_log
         ;;
     16)
-        check_install && enable
+        check_install && restart_xray
         ;;
     17)
-        check_install && disable
+        check_install && enable
         ;;
     18)
-        ssl_cert_issue_main
+        check_install && disable
         ;;
     19)
-        ssl_cert_issue_CF
+        ssl_cert_issue_main
         ;;
     20)
-        iplimit_main
+        ssl_cert_issue_CF
         ;;
     21)
-        firewall_menu
+        iplimit_main
         ;;
     22)
-        SSH_port_forwarding
+        firewall_menu
         ;;
     23)
-        bbr_menu
+        SSH_port_forwarding
         ;;
     24)
-        update_geo
+        bbr_menu
         ;;
     25)
+        update_geo
+        ;;
+    26)
         run_speedtest
         ;;
     *)
-        LOGE "请输入正确的数字 [0-25]"
+        LOGE "请输入正确的数字 [0-26]"
         ;;
     esac
 }
@@ -1202,6 +1211,9 @@ if [[ $# > 0 ]]; then
         ;;
     "uninstall")
         check_install 0 && uninstall 0
+        ;;
+    "restart-xray")
+        check_install 0 && restart_xray 0
         ;;
     *) show_usage ;;
     esac

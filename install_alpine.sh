@@ -238,6 +238,7 @@ install_x-ui() {
     echo -e "x-ui start        - 运行服务"
     echo -e "x-ui stop         - 停止服务"
     echo -e "x-ui restart      - 重启服务"
+    echo -e "x-ui restart-xray - 重启xray服务"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 打开服务开机自动启动"
