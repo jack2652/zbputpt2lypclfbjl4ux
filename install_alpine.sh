@@ -102,6 +102,37 @@ config_after_install() {
     /usr/local/x-ui/x-ui migrate
 }
 
+setup_xray_auto_restart() {
+    echo -e "${yellow}配置 Xray 自动重启定时任务...${plain}"
+    
+    # 确保 crond 服务已安装
+    if ! command -v crond &> /dev/null; then
+        echo -e "${yellow}安装 cronie 包...${plain}"
+        apk add --no-cache cronie
+    fi
+    
+    # 定时任务命令和注释
+    local cron_job="30 3 * * * /usr/bin/x-ui restart-xray >/dev/null 2>&1"
+    local cron_comment="# Auto restart xray daily at 3:30 AM"
+    
+    # 检查任务是否已存在（避免重复添加）
+    if ! grep -q "x-ui restart-xray" /etc/crontabs/root 2>/dev/null; then
+        # 添加定时任务
+        echo "${cron_comment}" >> /etc/crontabs/root
+        echo "${cron_job}" >> /etc/crontabs/root
+        echo -e "${green}定时任务已添加：每天凌晨 3:30 自动重启 xray${plain}"
+    else
+        echo -e "${green}定时任务已存在，跳过添加${plain}"
+    fi
+    
+    # 启动 crond 服务并设置开机自启
+    rc-update add crond default 2>/dev/null
+    rc-service crond start 2>/dev/null
+    
+    echo -e "${green}Xray 自动重启任务配置完成${plain}"
+}
+
+
 install_x-ui() {
 	cd /usr/local
     local arch=""
@@ -183,9 +214,10 @@ install_x-ui() {
         echo -e "${red}未找到 ${xray_binary}, 请检查下载的安装包是否匹配当前架构 ${arch}${plain}"
         exit 1
     fi
-
+    
     chmod +x x-ui/x-ui "x-ui/bin/${xray_binary}"
-    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
+
+    cp "${cur_dir}/ui-alpine.sh" /usr/bin/x-ui 2>/dev/null || wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
     chmod +x /usr/bin/x-ui
     wget --no-check-certificate -O /etc/init.d/x-ui "${repo_raw_base}/ui.rc"
     chmod +x /etc/init.d/x-ui
@@ -194,6 +226,10 @@ install_x-ui() {
     fail2ban-client -x start
     rc-update add x-ui default
     rc-service x-ui start
+    
+    # 配置 Xray 自动重启定时任务
+    setup_xray_auto_restart
+    
     echo -e "${green}x-ui ${tag_version}${plain} 安装完成, 运行中..."
     echo -e ""
     echo -e "x-ui子命令菜单:"
