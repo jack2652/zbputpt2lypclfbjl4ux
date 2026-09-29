@@ -256,11 +256,11 @@ install_service_definition() {
         chmod +x /etc/init.d/x-ui
     elif [[ "${service_manager}" == "systemd" ]]; then
         mkdir -p /etc/systemd/system
-        install_asset "x-ui.service" /etc/systemd/system/x-ui.service || return 1
+        install_asset "ui.service" /etc/systemd/system/x-ui.service || return 1
         chmod 644 /etc/systemd/system/x-ui.service
         systemctl daemon-reload
     else
-        install_asset "x-ui.init" /etc/init.d/x-ui || return 1
+        install_asset "ui.init" /etc/init.d/x-ui || return 1
         chmod +x /etc/init.d/x-ui
     fi
 }
@@ -470,7 +470,7 @@ install_x_ui() {
     rm -rf "${staging_dir}"
 
     chmod +x /usr/local/x-ui/x-ui "/usr/local/x-ui/bin/${xray_binary}"
-    install_asset "ui-alpine.sh" /usr/bin/x-ui || {
+    install_asset "ui.sh" /usr/bin/x-ui || {
         echo -e "${red}安装 x-ui 管理脚本失败${plain}"
         exit 1
     }

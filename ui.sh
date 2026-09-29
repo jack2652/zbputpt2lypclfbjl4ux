@@ -251,7 +251,7 @@ update_menu() {
         return 0
     fi
 
-    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui.sh"
     chmod +x /usr/bin/x-ui
 
     if [[ $? == 0 ]]; then
@@ -605,7 +605,7 @@ enable_bbr() {
 }
 
 update_shell() {
-    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui.sh"
     if [[ $? != 0 ]]; then
         echo ""
         LOGE "下载脚本失败, 请检查机器是否可以连接Github"
