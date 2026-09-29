@@ -146,6 +146,37 @@ get_download_url() {
     echo "https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-${arch}.tar.gz"
 }
 
+get_available_space_mb() {
+    local target_path="$1"
+    df -Pk "${target_path}" 2>/dev/null | awk 'NR == 2 {print int($4 / 1024)}'
+}
+
+check_install_space() {
+    local target_path="$1"
+    local available_mb=""
+    local existing_mb=0
+    local required_mb=512
+
+    available_mb=$(get_available_space_mb "${target_path}")
+    if ! [[ "${available_mb}" =~ ^[0-9]+$ ]]; then
+        echo -e "${red}无法检查 ${target_path} 的可用磁盘空间${plain}"
+        return 1
+    fi
+
+    if [[ -d "${target_path}/x-ui" ]]; then
+        existing_mb=$(du -sm "${target_path}/x-ui" 2>/dev/null | awk 'NR == 1 {print $1}')
+        [[ "${existing_mb}" =~ ^[0-9]+$ ]] || existing_mb=0
+    fi
+
+    required_mb=$((required_mb + existing_mb))
+
+    if (( available_mb < required_mb )); then
+        echo -e "${red}${target_path} 可用空间不足：当前约 ${available_mb} MiB，预计至少需要 ${required_mb} MiB（含现有 x-ui 临时保留空间）${plain}"
+        echo -e "${yellow}请先清理磁盘空间后再重试；安装器不会删除现有 x-ui 目录${plain}"
+        return 1
+    fi
+}
+
 version_at_least() {
     local actual="$1"
     local required="$2"
@@ -351,7 +382,6 @@ install_x_ui() {
     local arch=""
     local download_url=""
     local xray_binary=""
-    local archive_name=""
     local tag_version=""
     local tag_version_numeric=""
     local min_version="2.4.8"
@@ -368,8 +398,6 @@ install_x_ui() {
         armv5|armv6|armv7) xray_binary="xray-linux-arm32" ;;
         *) xray_binary="xray-linux-${arch}" ;;
     esac
-    archive_name="x-ui-linux-${arch}.tar.gz"
-
     if [[ $# -eq 0 ]]; then
         tag_version=$(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 \
             "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" |
@@ -390,22 +418,28 @@ install_x_ui() {
         exit 1
     fi
 
-    download_url=$(get_download_url "${tag_version}" "${arch}")
-    echo -e "${yellow}开始下载 x-ui ${tag_version} (${arch})...${plain}"
-    if ! curl -fL --retry 3 --proto '=https' --tlsv1.2 \
-        -o "/usr/local/${archive_name}" "${download_url}"; then
-        echo -e "${red}下载 x-ui 失败，请检查网络连接或版本是否存在${plain}"
-        rm -f "/usr/local/${archive_name}"
+    if ! check_install_space /usr/local; then
         exit 1
     fi
 
-    staging_dir=$(mktemp -d /usr/local/x-ui-install.XXXXXX) || exit 1
-    if ! tar -xzf "/usr/local/${archive_name}" -C "${staging_dir}"; then
-        echo -e "${red}解压 x-ui 安装包失败${plain}"
-        rm -rf "${staging_dir}" "/usr/local/${archive_name}"
+    download_url=$(get_download_url "${tag_version}" "${arch}")
+    echo -e "${yellow}开始下载并解压 x-ui ${tag_version} (${arch})...${plain}"
+    staging_dir=$(mktemp -d /usr/local/x-ui-install.XXXXXX) || {
+        echo -e "${red}无法创建临时安装目录，请检查 /usr/local 权限和磁盘空间${plain}"
+        exit 1
+    }
+
+    # 直接将压缩包流式传给 tar，避免同时占用压缩包和解压目录的磁盘空间。
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 "${download_url}" | \
+        tar -xzf - -C "${staging_dir}"
+    local pipeline_status=("${PIPESTATUS[@]}")
+    local curl_status="${pipeline_status[0]:-1}"
+    local tar_status="${pipeline_status[1]:-1}"
+    if (( curl_status != 0 || tar_status != 0 )); then
+        echo -e "${red}下载或解压 x-ui 安装包失败（curl=${curl_status}, tar=${tar_status}）${plain}"
+        rm -rf "${staging_dir}"
         exit 1
     fi
-    rm -f "/usr/local/${archive_name}"
 
     if [[ -d "${staging_dir}/x-ui/app" ]]; then
         cp -a "${staging_dir}/x-ui/app/." "${staging_dir}/x-ui/"
