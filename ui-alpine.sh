@@ -7,6 +7,9 @@ plain='\033[0m'
 repo_owner="jack2652"
 repo_name="zbputpt2lypclfbjl4ux"
 repo_raw_base="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/main"
+distro=""
+service_manager=""
+service_file=""
 
 #Add some basic function here
 function LOGD() {
@@ -24,29 +27,156 @@ function LOGI() {
 # check root
 [[ $EUID -ne 0 ]] && LOGE "严重错误: ${plain} 请以 root 权限运行此脚本 \n" && exit 1
 
-# Check OS and set release variable
+# Check OS and select package/service managers
 if [[ -f /etc/os-release ]]; then
     source /etc/os-release
-    release=$ID
 elif [[ -f /usr/lib/os-release ]]; then
     source /usr/lib/os-release
-    release=$ID
 else
     echo "系统OS检查失败, 请联系作者!" >&2
     exit 1
 fi
 
-echo "您的系统类型为: $release"
+case "${ID}" in
+alpine)
+    distro="alpine"
+    service_manager="openrc"
+    service_file="/etc/init.d/x-ui"
+    ;;
+debian|ubuntu)
+    distro="debian"
+    init_name="$(tr -d '[:space:]' < /proc/1/comm 2>/dev/null || true)"
+    if command -v systemctl >/dev/null 2>&1 && \
+        [[ "${init_name}" == "systemd" || -d /run/systemd/system ]]; then
+        service_manager="systemd"
+        service_file="/etc/systemd/system/x-ui.service"
+    elif command -v service >/dev/null 2>&1; then
+        service_manager="sysvinit"
+        service_file="/etc/init.d/x-ui"
+    elif command -v systemctl >/dev/null 2>&1; then
+        service_manager="systemd"
+        service_file="/etc/systemd/system/x-ui.service"
+    else
+        echo -e "${red}Debian/Ubuntu 环境缺少 systemd 或 SysV service 命令${plain}"
+        exit 1
+    fi
+    ;;
+*)
+    echo -e "${red}该脚本仅支持 Alpine、Debian 和 Ubuntu${plain}\n"
+    exit 1
+    ;;
+esac
 
-os_version=""
-os_version=$(grep "^VERSION_ID" /etc/os-release | cut -d '=' -f2 | tr -d '"' | tr -d '.')
-
-if [[ "${release}" == "alpine" ]]; then
-    echo "您的系统类型为Alpine Linux"
-else
-    echo -e "${red}该脚本不支持您的操作系统${plain}\n"
+if [[ "${service_manager}" == "openrc" ]] && ! command -v rc-service >/dev/null 2>&1; then
+    echo -e "${red}当前 Alpine 环境缺少 OpenRC 命令 rc-service${plain}"
     exit 1
 fi
+if [[ "${service_manager}" == "systemd" ]] && ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${red}当前 Debian/Ubuntu 环境缺少 systemctl${plain}"
+    exit 1
+fi
+if [[ "${distro}" == "debian" ]] && ! command -v apt-get >/dev/null 2>&1; then
+    echo -e "${red}当前 Debian/Ubuntu 环境缺少 apt-get${plain}"
+    exit 1
+fi
+if [[ "${distro}" == "alpine" ]] && ! command -v apk >/dev/null 2>&1; then
+    echo -e "${red}当前 Alpine 环境缺少 apk${plain}"
+    exit 1
+fi
+
+echo "您的系统类型为: ${ID}，服务管理器为: ${service_manager}"
+
+install_package() {
+    if [[ "${distro}" == "alpine" ]]; then
+        apk add --no-cache "$@"
+    else
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y "$@"
+    fi
+}
+
+validate_domain() {
+    local candidate="$1"
+    [[ "${candidate}" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] && \
+        [[ "${candidate}" == *.* ]] && [[ "${candidate}" != *..* ]]
+}
+
+service_start() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-service x-ui start
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl start x-ui.service
+    else
+        service x-ui start
+    fi
+}
+
+service_stop() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-service x-ui stop
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl stop x-ui.service
+    else
+        service x-ui stop
+    fi
+}
+
+service_restart() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-service x-ui restart
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl restart x-ui.service
+    else
+        service x-ui restart
+    fi
+}
+
+service_status() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-service x-ui status
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl --no-pager status x-ui.service
+    else
+        service x-ui status
+    fi
+}
+
+service_enable() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-update add x-ui default
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl enable x-ui.service
+    else
+        update-rc.d x-ui defaults
+    fi
+}
+
+service_disable() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-update del x-ui
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl disable x-ui.service
+    else
+        update-rc.d -f x-ui remove
+    fi
+}
+
+service_daemon_reload() {
+    if [[ "${service_manager}" == "systemd" ]]; then
+        systemctl daemon-reload
+    fi
+}
+
+service_reload() {
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-service x-ui reload
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        systemctl reload x-ui.service
+    else
+        service x-ui reload
+    fi
+}
 
 # Declare Variables
 log_folder="${XUI_LOG_FOLDER:=/var/log}"
@@ -84,7 +214,7 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -Ls "${repo_raw_base}/install_alpine.sh")
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh")
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -103,7 +233,7 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -Ls "${repo_raw_base}/install_alpine.sh")
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh")
     if [[ $? == 0 ]]; then
         LOGI "更新完成, 面板已自动重启"
         before_show_menu
@@ -121,7 +251,7 @@ update_menu() {
         return 0
     fi
 
-    wget --no-check-certificate -O /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
     chmod +x /usr/bin/x-ui
 
     if [[ $? == 0 ]]; then
@@ -135,17 +265,18 @@ update_menu() {
 
 legacy_version() {
     echo "输入版本信息 (例如 2.4.8):"
-    read tag_version
+    read -r tag_version
 
-    if [ -z "$tag_version" ]; then
+    if [[ -z "${tag_version}" || ! "${tag_version}" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
         echo "版本信息不能为空, 退出."
         exit 1
     fi
-    # 始终复用当前主分支安装器, 以便 arm64/aarch64 继续走新的架构识别逻辑。
-    install_command="bash <(curl -Ls \"${repo_raw_base}/install_alpine.sh\") v$tag_version"
 
-    echo "下载安装x-ui版本: $tag_version..."
-    eval $install_command
+    # 始终复用当前主分支安装器, 以便不同发行版和架构走统一逻辑。
+    [[ "${tag_version}" == v* ]] || tag_version="v${tag_version}"
+
+    echo "下载安装 x-ui 版本: ${tag_version}..."
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh") "${tag_version}"
 }
 
 # Function to handle the deletion of the script file
@@ -162,11 +293,24 @@ uninstall() {
         fi
         return 0
     fi
-      rc-update del x-ui
-      rc-service x-ui stop
-      rm /usr/local/x-ui/ -rf
-      rm /etc/init.d/x-ui
-      rm /etc/x-ui/ -rf
+      service_disable >/dev/null 2>&1 || true
+      service_stop >/dev/null 2>&1 || true
+      rm -rf /usr/local/x-ui /etc/x-ui
+      if [[ "${service_manager}" == "openrc" ]]; then
+          rm -f /etc/init.d/x-ui
+      elif [[ "${service_manager}" == "systemd" ]]; then
+          rm -f /etc/systemd/system/x-ui.service
+          service_daemon_reload
+      else
+          update-rc.d -f x-ui remove >/dev/null 2>&1 || true
+          rm -f /etc/init.d/x-ui
+      fi
+      if [[ "${distro}" == "alpine" ]]; then
+          sed -i '/x-ui restart-xray/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Auto restart xray daily at 3:30 AM/d' /etc/crontabs/root 2>/dev/null || true
+      else
+          rm -f /etc/cron.d/x-ui
+      fi
 	  if [[ -e /app/bin/ ]]; then
 	    pgrep -f x-ui | xargs -r kill -9
         rm /app -rf
@@ -174,7 +318,7 @@ uninstall() {
     echo ""
     echo -e "卸载成功.\n"
     echo "如果需要再次安装此面板, 可以使用以下命令:"
-    echo -e "${green}bash <(curl -Ls ${repo_raw_base}/install_alpine.sh)${plain}"
+    echo -e "${green}bash <(curl -fsSL ${repo_raw_base}/install_alpine.sh)${plain}"
     echo ""
     # Trap the SIGTERM signal
     trap delete_script SIGTERM
@@ -252,7 +396,8 @@ check_config() {
     local existing_webBasePath=$(echo "$info" | grep -Eo 'webBasePath: .+' | awk '{print $2}')
     local existing_port=$(echo "$info" | grep -Eo 'port: .+' | awk '{print $2}')
     local existing_cert=$(/usr/local/x-ui/x-ui setting -getCert true | grep -Eo 'cert: .+' | awk '{print $2}')
-    local server_ip=$(curl -s https://api.ipify.org)
+    local server_ip
+    server_ip=$(curl -fsSL --max-time 10 https://api.ipify.org 2>/dev/null || echo "服务器地址")
 
     if [[ -n "$existing_cert" ]]; then
         local domain=$(basename "$(dirname "$existing_cert")")
@@ -268,12 +413,15 @@ check_config() {
 }
 
 set_port() {
-    echo && echo -n -e "输入端口号[1-65535]: " && read port
+    echo && echo -n -e "输入端口号[1-65535]: " && read -r port
     if [[ -z "${port}" ]]; then
         LOGD "已取消"
         before_show_menu
+    elif ! [[ "${port}" =~ ^[0-9]+$ ]] || (( port < 1 || port > 65535 )); then
+        LOGE "端口必须是 1-65535 之间的数字"
+        before_show_menu
     else
-        /usr/local/x-ui/x-ui setting -port ${port}
+        /usr/local/x-ui/x-ui setting -port "${port}"
         echo -e "端口已设置, 请立即重启面板, 并使用新的端口 ${green}${port}${plain} 访问面板"
         confirm_restart
     fi
@@ -285,7 +433,7 @@ start() {
         echo ""
         LOGI "面板正在运行, 无需再次启动, 如需重启请选择重启"
     else
-        rc-service x-ui start
+        service_start
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
@@ -306,7 +454,7 @@ stop() {
         echo ""
         LOGI "面板已停止, 无需再次停止!"
     else
-        rc-service x-ui stop
+        service_stop
         sleep 2
         check_status
         if [[ $? == 1 ]]; then
@@ -322,9 +470,7 @@ stop() {
 }
 
 restart() {
-    rc-service x-ui stop
-	sleep 2
-	rc-service x-ui start
+    service_restart
     sleep 2
     check_status
     if [[ $? == 0 ]]; then
@@ -338,14 +484,14 @@ restart() {
 }
 
 status() {
-    rc-service x-ui status
+    service_status
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
 }
 
 enable() {
-    rc-update add x-ui default
+    service_enable
     if [[ $? == 0 ]]; then
         LOGI "x-ui成功设置为开机自动启动"
     else
@@ -358,7 +504,7 @@ enable() {
 }
 
 disable() {
-    rc-update del x-ui
+    service_disable
     if [[ $? == 0 ]]; then
         LOGI "x-ui自动启动已成功取消"
     else
@@ -382,7 +528,15 @@ show_banlog() {
 }
 
 restart_xray() {
-    restart $1
+    service_reload
+    if [[ $? -eq 0 ]]; then
+        LOGI "已向 x-ui 发送 Xray 重启信号，请检查服务状态确认重启结果"
+    else
+        LOGE "发送 Xray 重启信号失败"
+    fi
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
 }
 
 bbr_menu() {
@@ -451,7 +605,7 @@ enable_bbr() {
 }
 
 update_shell() {
-    wget -O /usr/bin/x-ui -N --no-check-certificate "${repo_raw_base}/ui-alpine.sh"
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui-alpine.sh"
     if [[ $? != 0 ]]; then
         echo ""
         LOGE "下载脚本失败, 请检查机器是否可以连接Github"
@@ -465,23 +619,32 @@ update_shell() {
 
 # 0: running, 1: not running, 2: not installed
 check_status() {
-    if [[ ! -f /etc/init.d/x-ui ]]; then
+    if [[ ! -f "${service_file}" ]]; then
         return 2
     fi
-    temp=$(rc-service x-ui status | grep started | awk '{print $3}' | cut -d ":" -f2)
-    if [[ "${temp}" == "started" ]]; then
+    if [[ "${service_manager}" == "openrc" ]]; then
+        if rc-service x-ui status 2>/dev/null | grep -q started; then
+            return 0
+        fi
+    elif [[ "${service_manager}" == "systemd" ]]; then
+        if systemctl is-active --quiet x-ui.service; then
+            return 0
+        fi
+    elif service x-ui status >/dev/null 2>&1; then
         return 0
-    else
-        return 1
     fi
+    return 1
 }
 
 check_enabled() {
-    if rc-update show | grep -q "x-ui"; then
-        return 0
-    else
-        return 1
+    if [[ "${service_manager}" == "openrc" ]]; then
+        rc-update show 2>/dev/null | grep -q "x-ui"
+        return $?
+    elif [[ "${service_manager}" == "sysvinit" ]]; then
+        compgen -G "/etc/rc*.d/[SK][0-9][0-9]x-ui" >/dev/null 2>&1
+        return $?
     fi
+    systemctl is-enabled --quiet x-ui.service
 }
 
 check_uninstall() {
@@ -582,35 +745,58 @@ update_geo() {
     echo -e "${green}\t0.${plain} 返回主菜单"
     read -p "请输入选项: " choice
 
-    cd /usr/local/x-ui/bin
+    if [[ ! -d /usr/local/x-ui/bin ]]; then
+        LOGE "未找到 /usr/local/x-ui/bin，无法更新 Geo 文件"
+        before_show_menu
+        return 1
+    fi
+    cd /usr/local/x-ui/bin || return 1
+
+    download_geo_asset() {
+        local target="$1"
+        local url="$2"
+        local temp="${target}.tmp.$$"
+
+        if ! curl -fL --retry 3 --proto '=https' --tlsv1.2 -o "${temp}" "${url}" || [[ ! -s "${temp}" ]]; then
+            rm -f "${temp}"
+            return 1
+        fi
+        mv -f "${temp}" "${target}"
+    }
 
     case "$choice" in
     0)
         show_menu
         ;;
     1)
-        rc-service x-ui stop
-        rm -f geoip.dat geosite.dat
-        wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
-        wget https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
-        echo -e "${green}Loyalsoldier 数据升级成功!${plain}"
-        rc-service x-ui start
+        service_stop
+        if download_geo_asset geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat && \
+            download_geo_asset geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat; then
+            echo -e "${green}Loyalsoldier 数据升级成功!${plain}"
+        else
+            LOGE "Loyalsoldier 数据下载失败，未主动删除原有文件"
+        fi
+        service_start
         ;;
     2)
-        rc-service x-ui stop
-        rm -f geoip_IR.dat geosite_IR.dat
-        wget -O geoip_IR.dat -N https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat
-        wget -O geosite_IR.dat -N https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
-        echo -e "${green}chocolate4u 数据升级成功!${plain}"
-        rc-service x-ui start
+        service_stop
+        if download_geo_asset geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat && \
+            download_geo_asset geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat; then
+            echo -e "${green}chocolate4u 数据升级成功!${plain}"
+        else
+            LOGE "chocolate4u 数据下载失败，未主动删除原有文件"
+        fi
+        service_start
         ;;
     3)
-        rc-service x-ui stop
-        rm -f geoip_VN.dat geosite_VN.dat
-        wget -O geoip_VN.dat -N https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geoip.dat
-        wget -O geosite_VN.dat -N https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geosite.dat
-        echo -e "${green}vuong2023 数据升级成功!${plain}"
-        rc-service x-ui start
+        service_stop
+        if download_geo_asset geoip_VN.dat https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geoip.dat && \
+            download_geo_asset geosite_VN.dat https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geosite.dat; then
+            echo -e "${green}vuong2023 数据升级成功!${plain}"
+        else
+            LOGE "vuong2023 数据下载失败，未主动删除原有文件"
+        fi
+        service_start
         ;;
     *)
         echo -e "${red}选项无效请选择一个有效的数字${plain}\n"
@@ -631,7 +817,7 @@ install_acme() {
     LOGI "安装中 acme.sh..."
     cd ~ || return 1 # Ensure you can change to the home directory
 
-    curl -s https://get.acme.sh | sh
+    curl -fsSL --retry 3 --proto '=https' --tlsv1.2 https://get.acme.sh | sh
     if [ $? -ne 0 ]; then
         LOGE "安装acme.sh失败."
         return 1
@@ -761,12 +947,7 @@ ssl_cert_issue() {
             exit 1
         fi
     fi
-	if [[ "${release}" == "alpine" ]]; then
-		apk update && apk add socat
-	else
-		echo -e "${red}该脚本不支持您的操作系统${plain}\n"
-		exit 1
-	fi
+    install_package socat
     if [ $? -ne 0 ]; then
         LOGE "安装socat失败"
         exit 1
@@ -776,7 +957,11 @@ ssl_cert_issue() {
 
     # get the domain here, and we need to verify it
     local domain=""
-    read -p "请输入您的域名: " domain
+    read -r -p "请输入您的域名: " domain
+    if ! validate_domain "${domain}"; then
+        LOGE "域名格式无效"
+        return 1
+    fi
     LOGD "您的域名是: ${domain}"
 
     # check if there already exists a certificate
@@ -810,7 +995,7 @@ ssl_cert_issue() {
 
     # issue the certificate
     ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-    ~/.acme.sh/acme.sh --issue -d ${domain} --listen-v6 --standalone --httpport ${WebPort}
+    ~/.acme.sh/acme.sh --issue -d "${domain}" --listen-v6 --standalone --httpport "${WebPort}"
     if [ $? -ne 0 ]; then
         LOGE "颁发证书失败, 请检查日志"
         rm -rf ~/.acme.sh/${domain}
@@ -820,9 +1005,9 @@ ssl_cert_issue() {
     fi
 
     # install the certificate
-    ~/.acme.sh/acme.sh --installcert -d ${domain} \
-        --key-file /root/cert/${domain}/privkey.pem \
-        --fullchain-file /root/cert/${domain}/fullchain.pem
+    ~/.acme.sh/acme.sh --installcert -d "${domain}" \
+        --key-file "/root/cert/${domain}/privkey.pem" \
+        --fullchain-file "/root/cert/${domain}/fullchain.pem"
 
     if [ $? -ne 0 ]; then
         LOGE "安装证书失败, 退出"
@@ -837,12 +1022,16 @@ ssl_cert_issue() {
     if [ $? -ne 0 ]; then
         LOGE "自动续订失败, 证书详细信息:"
         ls -lah cert/*
-        chmod 755 $certPath/*
+        chmod 700 "${certPath}"
+        chmod 644 "${certPath}/fullchain.pem"
+        chmod 600 "${certPath}/privkey.pem"
         exit 1
     else
         LOGI "自动续订成功, 证书详细信息:"
         ls -lah cert/*
-        chmod 755 $certPath/*
+        chmod 700 "${certPath}"
+        chmod 644 "${certPath}/fullchain.pem"
+        chmod 600 "${certPath}/privkey.pem"
     fi
 
     # Prompt user to set panel paths after successful certificate installation
@@ -893,25 +1082,29 @@ ssl_cert_issue_CF() {
         CF_Domain=""
         certPath="/root/cert-CF"
         if [ ! -d "$certPath" ]; then
-            mkdir -p $certPath
+            mkdir -p "${certPath}"
         else
-            rm -rf $certPath
-            mkdir -p $certPath
+            rm -rf "${certPath}"
+            mkdir -p "${certPath}"
         fi
 
         LOGD "请设置域名:"
-        read -p "在此输入您的域名: " CF_Domain
+        read -r -p "在此输入您的域名: " CF_Domain
+        if ! validate_domain "${CF_Domain}"; then
+            LOGE "域名格式无效"
+            return 1
+        fi
         LOGD "您的域名设置为: ${CF_Domain}"
 
         # Set up Cloudflare API details
         CF_GlobalKey=""
         CF_AccountEmail=""
         LOGD "请设置API key:"
-        read -p "输入您的Global API Key: " CF_GlobalKey
-        LOGD "你的Global API Key是: ${CF_GlobalKey}"
+        read -r -s -p "输入您的Global API Key: " CF_GlobalKey
+        echo
 
         LOGD "请设置注册的邮箱地址:"
-        read -p "输入您的邮箱地址: " CF_AccountEmail
+        read -r -p "输入您的邮箱地址: " CF_AccountEmail
         LOGD "你的邮箱地址是: ${CF_AccountEmail}"
 
         # Set the default CA to Let's Encrypt
@@ -925,7 +1118,7 @@ ssl_cert_issue_CF() {
         export CF_Email="${CF_AccountEmail}"
 
         # Issue the certificate using Cloudflare DNS
-        ~/.acme.sh/acme.sh --issue --dns dns_cf -d ${CF_Domain} -d *.${CF_Domain} --log
+        ~/.acme.sh/acme.sh --issue --dns dns_cf -d "${CF_Domain}" -d "*.${CF_Domain}" --log
         if [ $? -ne 0 ]; then
             LOGE "证书颁发失败, 脚本退出..."
             exit 1
@@ -934,15 +1127,15 @@ ssl_cert_issue_CF() {
         fi
 
         # Install the certificate
-        mkdir -p ${certPath}/${CF_Domain}
+        mkdir -p "${certPath}/${CF_Domain}"
         if [ $? -ne 0 ]; then
             LOGE "无法创建目录: ${certPath}/${CF_Domain}"
             exit 1
         fi
 
-        ~/.acme.sh/acme.sh --installcert -d ${CF_Domain} -d *.${CF_Domain} \
-            --fullchain-file ${certPath}/${CF_Domain}/fullchain.pem \
-            --key-file ${certPath}/${CF_Domain}/privkey.pem
+        ~/.acme.sh/acme.sh --installcert -d "${CF_Domain}" -d "*.${CF_Domain}" \
+            --fullchain-file "${certPath}/${CF_Domain}/fullchain.pem" \
+            --key-file "${certPath}/${CF_Domain}/privkey.pem"
 
         if [ $? -ne 0 ]; then
             LOGE "证书安装失败, 脚本退出..."
@@ -959,7 +1152,9 @@ ssl_cert_issue_CF() {
         else
             LOGI "证书安装完毕, 并开启自动续订, 具体信息如下:"
             ls -lah ${certPath}/${CF_Domain}
-            chmod 755 ${certPath}/${CF_Domain}
+            chmod 700 "${certPath}/${CF_Domain}"
+            chmod 644 "${certPath}/${CF_Domain}/fullchain.pem"
+            chmod 600 "${certPath}/${CF_Domain}/privkey.pem"
         fi
 
         # Prompt user to set panel paths after successful certificate installation

@@ -5,9 +5,20 @@ command_background=true
 pidfile="/run/x-ui.pid"
 description="Custom service for x-ui"
 procname="x-ui"
+export XRAY_VMESS_AEAD_FORCED="${XRAY_VMESS_AEAD_FORCED:-false}"
 depend() {
     need net
 }
 start_pre(){
     cd /usr/local/x-ui
+}
+
+reload() {
+    ebegin "Reloading ${RC_SVCNAME}"
+    if [ -f "${pidfile}" ]; then
+        kill -USR1 "$(cat "${pidfile}")"
+        eend $?
+    else
+        eend 1
+    fi
 }

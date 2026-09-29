@@ -36,6 +36,7 @@ show_usage() {
   3. 增加和减少会同步维护 /etc/fstab，重启后仍然生效
   4. 允许与宿主提供的 virtual swap 共存；如果存在其他 file/partition swap，则只允许查看
   5. 如果检测到当前为 LXC 容器，则仅保留查看功能，新增或调整 swapfile 请到宿主机配置
+  6. 支持 Alpine、Debian 和 Ubuntu
 EOF
 }
 
@@ -47,7 +48,12 @@ pause_return() {
 detect_arch() {
     case "$(uname -m)" in
         x86_64 | x64 | amd64) echo "amd64" ;;
+        i?86 | x86) echo "386" ;;
         aarch64 | arm64 | armv8 | armv8*) echo "arm64" ;;
+        armv7* | armv7 | arm) echo "armv7" ;;
+        armv6* | armv6) echo "armv6" ;;
+        armv5* | armv5) echo "armv5" ;;
+        s390x) echo "s390x" ;;
         *) return 1 ;;
     esac
 }
@@ -91,14 +97,23 @@ ensure_environment() {
         exit 1
     fi
 
-    if [[ "${ID}" != "alpine" ]]; then
-        LOGE "当前脚本仅支持 Alpine Linux"
+    case "${ID}" in
+        alpine|debian|ubuntu)
+            ;;
+        *)
+            LOGE "当前脚本仅支持 Alpine、Debian 和 Ubuntu"
+            exit 1
+            ;;
+    esac
+
+    if [[ "${ID}" == "debian" || "${ID}" == "ubuntu" ]] && ! command -v apt-get >/dev/null 2>&1; then
+        LOGE "未找到 apt-get，无法在当前 Debian/Ubuntu 系统安装依赖"
         exit 1
     fi
 
     current_arch=$(detect_arch)
     if [[ -z "${current_arch}" ]]; then
-        LOGE "当前仅支持 amd64 和 arm64/aarch64 架构"
+        LOGE "无法识别当前 CPU 架构，无法继续管理 swap"
         exit 1
     fi
 
@@ -112,11 +127,16 @@ ensure_swap_tools() {
         return 0
     fi
 
-    LOGD "检测到缺少 swap 管理工具, 正在尝试安装 util-linux-misc..."
-    apk add --no-cache util-linux-misc >/dev/null 2>&1 || apk add --no-cache util-linux >/dev/null 2>&1
+    LOGD "检测到缺少 swap 管理工具, 正在尝试安装 util-linux..."
+    if [[ "${ID}" == "alpine" ]]; then
+        apk add --no-cache util-linux-misc >/dev/null 2>&1 || apk add --no-cache util-linux >/dev/null 2>&1
+    else
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update >/dev/null 2>&1 && apt-get install -y util-linux >/dev/null 2>&1
+    fi
 
     if ! command -v mkswap >/dev/null 2>&1 || ! command -v swapon >/dev/null 2>&1 || ! command -v swapoff >/dev/null 2>&1; then
-        LOGE "安装 swap 管理工具失败, 请先手动安装 util-linux-misc 后再重试"
+        LOGE "安装 swap 管理工具失败, 请先手动安装 util-linux 后再重试"
         exit 1
     fi
 }
@@ -495,6 +515,19 @@ apply_target_swap_size() {
     local target_mb="$1"
     local swapon_stderr_file=""
     local swapon_error_message=""
+    local backup_file=""
+    local had_active_swap=0
+
+    restore_swap_backup() {
+        rm -f "${managed_swap_file}"
+        if [[ -n "${backup_file}" && -e "${backup_file}" ]]; then
+            mv "${backup_file}" "${managed_swap_file}" || return 1
+        fi
+        if (( had_active_swap )); then
+            swapon "${managed_swap_file}" >/dev/null 2>&1 || return 1
+        fi
+        return 0
+    }
 
     if (( target_mb <= 0 )); then
         LOGE "目标大小必须大于 0"
@@ -507,9 +540,22 @@ apply_target_swap_size() {
             LOGE "停用 ${managed_swap_file} 失败, 请先确认当前系统有足够可用内存"
             return 1
         fi
+        had_active_swap=1
+    fi
+
+    if [[ -f "${managed_swap_file}" ]]; then
+        backup_file="${managed_swap_file}.x-ui-backup.$$"
+        if ! mv "${managed_swap_file}" "${backup_file}"; then
+            LOGE "无法暂存原有 swap 文件，已中止调整"
+            if (( had_active_swap )); then
+                swapon "${managed_swap_file}" >/dev/null 2>&1 || true
+            fi
+            return 1
+        fi
     fi
 
     if ! prepare_swap_file "${target_mb}" "auto"; then
+        restore_swap_backup || LOGE "恢复原有 swap 文件失败，请立即检查当前 Swap 状态"
         return 1
     fi
 
@@ -520,6 +566,7 @@ apply_target_swap_size() {
             LOGD "检测到 ${managed_swap_file} 存在 holes，正在自动改用 dd 重建并重试..."
             rm -f "${swapon_stderr_file}"
             if ! prepare_swap_file "${target_mb}" "dd"; then
+                restore_swap_backup || LOGE "恢复原有 swap 文件失败，请立即检查当前 Swap 状态"
                 return 1
             fi
 
@@ -527,21 +574,25 @@ apply_target_swap_size() {
             swapon "${managed_swap_file}" 2> "${swapon_stderr_file}" || {
                 handle_swapon_failure "${swapon_stderr_file}" "脚本已自动改用 dd 重建后再次尝试，但仍然失败"
                 rm -f "${swapon_stderr_file}"
+                restore_swap_backup || LOGE "恢复原有 swap 文件失败，请立即检查当前 Swap 状态"
                 return 1
             }
             rm -f "${swapon_stderr_file}"
             rewrite_fstab_swap_entry "yes"
+            [[ -n "${backup_file}" ]] && rm -f "${backup_file}"
             LOGI "已将 ${managed_swap_file} 调整为 $(format_mb "${target_mb}")，并自动改用 dd 方式启用成功，重启后仍然生效"
             return 0
         fi
 
         handle_swapon_failure "${swapon_stderr_file}"
         rm -f "${swapon_stderr_file}"
+        restore_swap_backup || LOGE "恢复原有 swap 文件失败，请立即检查当前 Swap 状态"
         return 1
     }
     rm -f "${swapon_stderr_file}"
 
     rewrite_fstab_swap_entry "yes"
+    [[ -n "${backup_file}" ]] && rm -f "${backup_file}"
     LOGI "已将 ${managed_swap_file} 调整为 $(format_mb "${target_mb}")，重启后仍然生效"
     return 0
 }
@@ -712,7 +763,7 @@ reduce_swap() {
 show_menu() {
     while true; do
         echo -e "
-  ${green}Alpine虚拟内存管理脚本${plain}
+  ${green}Linux 虚拟内存管理脚本${plain}
   ${green}1.${plain} 查看当前虚拟内存
   ${green}2.${plain} 增加虚拟内存
   ${green}3.${plain} 减少虚拟内存
