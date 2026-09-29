@@ -214,7 +214,7 @@ before_show_menu() {
 }
 
 install() {
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh")
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh")
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -233,7 +233,7 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh")
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh")
     if [[ $? == 0 ]]; then
         LOGI "更新完成, 面板已自动重启"
         before_show_menu
@@ -276,7 +276,7 @@ legacy_version() {
     [[ "${tag_version}" == v* ]] || tag_version="v${tag_version}"
 
     echo "下载安装 x-ui 版本: ${tag_version}..."
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install_alpine.sh") "${tag_version}"
+    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh") "${tag_version}"
 }
 
 # Function to handle the deletion of the script file
@@ -318,7 +318,7 @@ uninstall() {
     echo ""
     echo -e "卸载成功.\n"
     echo "如果需要再次安装此面板, 可以使用以下命令:"
-    echo -e "${green}bash <(curl -fsSL ${repo_raw_base}/install_alpine.sh)${plain}"
+    echo -e "${green}bash <(curl -fsSL ${repo_raw_base}/install.sh)${plain}"
     echo ""
     # Trap the SIGTERM signal
     trap delete_script SIGTERM
