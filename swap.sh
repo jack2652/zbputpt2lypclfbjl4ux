@@ -26,9 +26,9 @@ function LOGI() {
 show_usage() {
     cat <<'EOF'
 用法:
-  bash swap-alpine.sh
-  SWAP_FILE=/swap.img bash swap-alpine.sh
-  bash swap-alpine.sh --help
+  bash swap.sh
+  SWAP_FILE=/swap.img bash swap.sh
+  bash swap.sh --help
 
 说明:
   1. 提供查看当前虚拟内存、增加虚拟内存、减少虚拟内存、退出四项菜单
