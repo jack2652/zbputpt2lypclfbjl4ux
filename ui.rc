@@ -3,6 +3,7 @@
 command="/usr/local/x-ui/x-ui"
 command_background=true
 pidfile="/run/x-ui.pid"
+retry="TERM/15/KILL/5"
 description="Custom service for x-ui"
 procname="x-ui"
 export XRAY_VMESS_AEAD_FORCED="${XRAY_VMESS_AEAD_FORCED:-false}"

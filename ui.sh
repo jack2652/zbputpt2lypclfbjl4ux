@@ -122,14 +122,172 @@ service_stop() {
     fi
 }
 
-service_restart() {
-    if [[ "${service_manager}" == "openrc" ]]; then
-        rc-service x-ui restart
-    elif [[ "${service_manager}" == "systemd" ]]; then
-        systemctl restart x-ui.service
-    else
-        service x-ui restart
+service_pid_file="/run/x-ui.pid"
+service_binary="/usr/local/x-ui/x-ui"
+service_stop_timeout=15
+service_start_timeout=15
+
+service_is_xui_process() {
+    local pid="$1"
+    local executable=""
+
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+    [[ -r "/proc/${pid}/exe" ]] || return 1
+    executable=$(readlink -f "/proc/${pid}/exe" 2>/dev/null) || return 1
+    [[ "${executable}" == "${service_binary}" ]]
+}
+
+service_get_pid() {
+    local pid=""
+
+    if [[ "${service_manager}" == "systemd" ]]; then
+        pid=$(systemctl show -p MainPID --value x-ui.service 2>/dev/null || true)
+    elif [[ -r "${service_pid_file}" ]]; then
+        pid=$(cat "${service_pid_file}" 2>/dev/null || true)
     fi
+
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 1
+    echo "${pid}"
+}
+
+service_wait_stopped() {
+    local timeout="${1:-${service_stop_timeout}}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        check_status
+        if [[ $? != 0 ]]; then
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    check_status
+    [[ $? != 0 ]]
+}
+
+service_wait_started() {
+    local timeout="${1:-${service_start_timeout}}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        check_status
+        if [[ $? == 0 ]]; then
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    check_status
+    [[ $? == 0 ]]
+}
+
+service_wait_process_exit() {
+    local pid="$1"
+    local timeout="${2:-5}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        if ! service_is_xui_process "${pid}"; then
+            return 0
+        fi
+        sleep 1
+        ((elapsed++))
+    done
+
+    ! service_is_xui_process "${pid}"
+}
+
+service_clear_pid_file() {
+    local pid="$1"
+    local stored_pid=""
+
+    [[ -f "${service_pid_file}" ]] || return 0
+    stored_pid=$(cat "${service_pid_file}" 2>/dev/null || true)
+    if [[ "${stored_pid}" == "${pid}" ]]; then
+        rm -f "${service_pid_file}"
+    fi
+}
+
+service_force_stop() {
+    local pid="${1:-}"
+
+    if [[ -z "${pid}" ]]; then
+        pid=$(service_get_pid) || {
+            LOGE "无法读取 x-ui 主进程 PID，已拒绝强制结束"
+            return 1
+        }
+    fi
+    if ! service_is_xui_process "${pid}"; then
+        LOGE "PID ${pid} 当前不是 /usr/local/x-ui/x-ui，已拒绝强制结束"
+        return 1
+    fi
+
+    LOGD "常规停止未完成，向 x-ui 主进程 ${pid} 发送 TERM"
+    kill -TERM "${pid}" 2>/dev/null || true
+    if service_wait_process_exit "${pid}" 5; then
+        service_clear_pid_file "${pid}"
+        return 0
+    fi
+
+    if ! service_is_xui_process "${pid}"; then
+        service_clear_pid_file "${pid}"
+        return 0
+    fi
+
+    LOGD "x-ui 未响应 TERM，向 x-ui 主进程 ${pid} 发送 KILL"
+    kill -KILL "${pid}" 2>/dev/null || true
+    if service_wait_process_exit "${pid}" 5; then
+        service_clear_pid_file "${pid}"
+        return 0
+    fi
+
+    LOGE "强制结束 x-ui 失败，请检查进程 ${pid} 和系统日志"
+    return 1
+}
+
+service_stop_with_fallback() {
+    local pid=""
+    local pid_is_xui=1
+
+    pid=$(service_get_pid || true)
+    if [[ -n "${pid}" ]] && service_is_xui_process "${pid}"; then
+        pid_is_xui=0
+    fi
+    service_stop || true
+
+    if [[ "${pid_is_xui}" == 0 ]]; then
+        if service_wait_process_exit "${pid}" "${service_stop_timeout}"; then
+            if service_wait_stopped 5; then
+                service_clear_pid_file "${pid}"
+                return 0
+            fi
+
+            pid=$(service_get_pid || true)
+            if [[ -z "${pid}" ]] || ! service_is_xui_process "${pid}"; then
+                LOGE "x-ui 主进程已退出，但服务仍报告运行且无法确认新的主进程"
+                return 1
+            fi
+        fi
+    elif service_wait_stopped; then
+        return 0
+    fi
+
+    LOGD "常规停止未完成，开始执行强制停止兜底"
+    if ! service_force_stop "${pid}"; then
+        return 1
+    fi
+    if [[ "${pid_is_xui}" == 0 ]] && ! service_wait_process_exit "${pid}" 5; then
+        return 1
+    fi
+    service_wait_stopped 5
+}
+
+service_restart() {
+    service_stop_with_fallback || return 1
+    service_start
 }
 
 service_status() {
@@ -449,38 +607,40 @@ start() {
 }
 
 stop() {
+    local result=0
+
     check_status
     if [[ $? == 1 ]]; then
         echo ""
         LOGI "面板已停止, 无需再次停止!"
     else
-        service_stop
-        sleep 2
-        check_status
-        if [[ $? == 1 ]]; then
+        if service_stop_with_fallback; then
             LOGI "x-ui和xray已成功停止"
         else
-            LOGE "面板停止失败, 可能是因为停止时间超过两秒, 请稍后查看日志信息"
+            LOGE "面板停止失败，常规停止和强制停止均未成功"
+            result=1
         fi
     fi
 
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "${result}"
 }
 
 restart() {
-    service_restart
-    sleep 2
-    check_status
-    if [[ $? == 0 ]]; then
+    local result=0
+
+    if service_restart && service_wait_started; then
         LOGI "x-ui和xray重启成功"
     else
-        LOGE "面板重启失败, 可能是因为启动时间超过两秒, 请稍后查看日志信息"
+        LOGE "面板重启失败，停止或启动阶段未成功"
+        result=1
     fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "${result}"
 }
 
 status() {
