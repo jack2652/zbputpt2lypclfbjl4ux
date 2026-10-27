@@ -835,11 +835,6 @@ reset_user_locked() {
     }
     echo -e "面板登录用户名已重置为: ${green} ${account} ${plain}"
     echo -e "面板登录密码已重置为: ${green} ${password} ${plain}"
-    if /usr/local/x-ui/x-ui setting -remove_secret; then
-        echo -e "${yellow} 面板登录秘密令牌已禁用 ${plain}"
-    else
-        LOGE "新凭据已设置，但清除面板秘密令牌失败；请检查上方错误信息"
-    fi
     echo -e "${green} 请使用新的登录用户名和密码访问 X-UI 面板请记住它们! ${plain}"
     if [[ "${restart_after}" == "1" ]]; then
         restart_locked
