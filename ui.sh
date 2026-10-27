@@ -529,6 +529,61 @@ service_force_stop() {
     return 1
 }
 
+xray_stop_residual_processes() {
+    local pid=""
+    local expected_start=""
+    local actual_start=""
+    local executable=""
+    local attempt=0
+    local failed_pids=""
+    local -a pids=()
+    local -a target_pids=()
+    local -a starts=()
+    local index=0
+
+    mapfile -t pids < <(xray_process_ids)
+    for pid in "${pids[@]}"; do
+        expected_start=$(process_start_time "${pid}" || true)
+        [[ "${expected_start}" =~ ^[0-9]+$ ]] || continue
+        executable=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+        case "${executable}" in
+        /usr/local/x-ui/bin/xray-linux-*) ;;
+        *) continue ;;
+        esac
+        actual_start=$(process_start_time "${pid}" || true)
+        [[ "${actual_start}" == "${expected_start}" ]] || continue
+        executable=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+        case "${executable}" in
+        /usr/local/x-ui/bin/xray-linux-*) ;;
+        *) continue ;;
+        esac
+        LOGD "强制结束残留 Xray 进程 PID ${pid}"
+        kill -KILL "${pid}" 2>/dev/null || true
+        target_pids+=("${pid}")
+        starts+=("${expected_start}")
+    done
+
+    for ((index = 0; index < ${#starts[@]}; index++)); do
+        pid="${target_pids[${index}]}"
+        expected_start="${starts[${index}]}"
+        for ((attempt = 0; attempt < 2; attempt++)); do
+            actual_start=$(process_start_time "${pid}" || true)
+            [[ "${actual_start}" == "${expected_start}" ]] || break
+            sleep 1
+        done
+        actual_start=$(process_start_time "${pid}" || true)
+        if [[ "${actual_start}" == "${expected_start}" ]]; then
+            failed_pids+=" ${pid}"
+        fi
+    done
+
+    if [[ -n "${failed_pids}" ]]; then
+        LOGE "以下 Xray 进程在 SIGKILL 后仍未退出，已中止后续启动：${failed_pids}"
+        return 1
+    fi
+    return 0
+}
+
 service_stop_with_fallback() {
     local pid=""
     local pid_is_xui=1
@@ -544,6 +599,7 @@ service_stop_with_fallback() {
         if ! service_is_xui_process "${pid}"; then
             if service_wait_stopped 5; then
                 service_clear_pid_file "${pid}"
+                xray_stop_residual_processes || return 1
                 return 0
             fi
 
@@ -554,7 +610,8 @@ service_stop_with_fallback() {
             fi
         fi
     elif service_wait_stopped; then
-        return 0
+        xray_stop_residual_processes
+        return $?
     fi
 
     LOGD "常规停止未完成，开始执行强制停止兜底"
@@ -564,7 +621,8 @@ service_stop_with_fallback() {
     if [[ "${pid_is_xui}" == 0 ]] && ! service_wait_process_exit "${pid}" 5; then
         return 1
     fi
-    service_wait_stopped 5
+    service_wait_stopped 5 || return 1
+    xray_stop_residual_processes
 }
 
 service_restart() {
@@ -956,17 +1014,20 @@ set_port_locked() {
 }
 
 start_locked() {
-    rm -f "${watchdog_paused_file}"
-    rm -f "${watchdog_cooldown_file}"
     check_status
     if [[ $? == 0 ]]; then
+        rm -f "${watchdog_paused_file}"
+        rm -f "${watchdog_cooldown_file}"
         echo ""
         LOGI "面板正在运行, 无需再次启动, 如需重启请选择重启"
     else
+        xray_stop_residual_processes || return 1
         service_start || return 1
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
+            rm -f "${watchdog_paused_file}"
+            rm -f "${watchdog_cooldown_file}"
             watchdog_set_cooldown || true
             LOGI "x-ui启动成功"
         else
@@ -987,6 +1048,7 @@ start() {
 
 stop_locked() {
     local result=0
+    local xray_pids=""
 
     if ! : > "${watchdog_paused_file}"; then
         LOGE "无法记录手动停止状态，已取消停止操作"
@@ -994,8 +1056,15 @@ stop_locked() {
     fi
     check_status
     if [[ $? == 1 ]]; then
-        echo ""
-        LOGI "面板已停止, 无需再次停止!"
+        xray_pids=$(xray_process_ids || true)
+        if [[ -z "${xray_pids}" ]]; then
+            echo ""
+            LOGI "面板已停止, 无需再次停止!"
+        elif xray_stop_residual_processes; then
+            LOGI "已清理面板停止后残留的 Xray 进程"
+        else
+            result=1
+        fi
     else
         if service_stop_with_fallback; then
             LOGI "x-ui和xray已成功停止"

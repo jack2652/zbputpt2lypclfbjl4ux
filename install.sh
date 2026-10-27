@@ -228,6 +228,88 @@ service_stop() {
     fi
 }
 
+installer_xui_is_running() {
+    local proc_dir=""
+    local executable=""
+
+    for proc_dir in /proc/[0-9]*; do
+        [[ -L "${proc_dir}/exe" ]] || continue
+        executable=$(readlink -f "${proc_dir}/exe" 2>/dev/null) || continue
+        case "${executable}" in
+        /usr/local/x-ui/x-ui|"/usr/local/x-ui/x-ui (deleted)") return 0 ;;
+        esac
+    done
+    return 1
+}
+
+installer_process_start_time() {
+    local pid="$1"
+    local stat=""
+    local stat_fields=()
+
+    IFS= read -r stat < "/proc/${pid}/stat" 2>/dev/null || return 1
+    stat="${stat##*) }"
+    read -r -a stat_fields <<< "${stat}"
+    [[ "${stat_fields[0]:-}" != "Z" ]] || return 1
+    [[ "${stat_fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${stat_fields[19]}"
+}
+
+stop_installed_xray_processes() {
+    local proc_dir=""
+    local pid=""
+    local expected_start=""
+    local actual_start=""
+    local executable=""
+    local index=0
+    local attempt=0
+    local failed_pids=""
+    local -a pids=()
+    local -a starts=()
+
+    for proc_dir in /proc/[0-9]*; do
+        [[ -L "${proc_dir}/exe" ]] || continue
+        pid="${proc_dir##*/}"
+        executable=$(readlink "${proc_dir}/exe" 2>/dev/null || true)
+        case "${executable}" in
+        /usr/local/x-ui/bin/xray-linux-*) ;;
+        *) continue ;;
+        esac
+        expected_start=$(installer_process_start_time "${pid}" || true)
+        [[ "${expected_start}" =~ ^[0-9]+$ ]] || continue
+        actual_start=$(installer_process_start_time "${pid}" || true)
+        [[ "${actual_start}" == "${expected_start}" ]] || continue
+        executable=$(readlink "/proc/${pid}/exe" 2>/dev/null || true)
+        case "${executable}" in
+        /usr/local/x-ui/bin/xray-linux-*) ;;
+        *) continue ;;
+        esac
+        echo -e "${yellow}强制结束旧 Xray 进程 PID ${pid}...${plain}"
+        kill -KILL "${pid}" 2>/dev/null || true
+        pids+=("${pid}")
+        starts+=("${expected_start}")
+    done
+
+    for ((index = 0; index < ${#pids[@]}; index++)); do
+        pid="${pids[${index}]}"
+        expected_start="${starts[${index}]}"
+        for ((attempt = 0; attempt < 2; attempt++)); do
+            actual_start=$(installer_process_start_time "${pid}" || true)
+            [[ "${actual_start}" == "${expected_start}" ]] || break
+            sleep 1
+        done
+        actual_start=$(installer_process_start_time "${pid}" || true)
+        if [[ "${actual_start}" == "${expected_start}" ]]; then
+            failed_pids+=" ${pid}"
+        fi
+    done
+
+    if [[ -n "${failed_pids}" ]]; then
+        echo -e "${red}以下旧 Xray 进程在 SIGKILL 后仍未退出：${failed_pids}；为避免遗留进程占用端口，已中止更新${plain}"
+        return 1
+    fi
+}
+
 service_enable() {
     if [[ "${service_manager}" == "openrc" ]]; then
         rc-update add x-ui default
@@ -498,6 +580,15 @@ install_x_ui() {
     fi
 
     service_stop
+    if installer_xui_is_running; then
+        echo -e "${red}x-ui 主进程停止失败，已中止更新以避免替换运行中的程序${plain}"
+        rm -rf "${staging_dir}"
+        exit 1
+    fi
+    if ! stop_installed_xray_processes; then
+        rm -rf "${staging_dir}"
+        exit 1
+    fi
     if [[ -e /usr/local/x-ui ]]; then
         echo -e "${yellow}停止并替换旧版本...${plain}"
         rm -rf /usr/local/x-ui
