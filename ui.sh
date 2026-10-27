@@ -863,12 +863,7 @@ show_enable_status() {
 }
 
 check_xray_status() {
-    count=$(ps -ef | grep "xray-linux" | grep -v "grep" | wc -l)
-    if [[ $count -ne 0 ]]; then
-        return 0
-    else
-        return 1
-    fi
+    xray_process_ids | grep -q .
 }
 
 show_xray_status() {
@@ -878,6 +873,110 @@ show_xray_status() {
     else
         echo -e "xray状态: ${red}未启动${plain}"
     fi
+}
+
+xray_process_ids() {
+    local proc_dir=""
+    local executable=""
+
+    for proc_dir in /proc/[0-9]*; do
+        [[ -L "${proc_dir}/exe" ]] || continue
+        executable=$(readlink "${proc_dir}/exe" 2>/dev/null) || continue
+        case "${executable}" in
+        /usr/local/x-ui/bin/xray-linux-*)
+            printf '%s\n' "${proc_dir##*/}"
+            ;;
+        esac
+    done
+}
+
+check_xray_health() {
+    local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
+    local xray_binary=""
+    local pid=""
+    local process_state=""
+    local pid_pattern=""
+    local listener_output=""
+    local result=0
+    local api_result=2
+    local -a pids=()
+
+    while IFS= read -r pid; do
+        [[ -n "${pid}" ]] && pids+=("${pid}")
+    done < <(xray_process_ids)
+
+    echo -e "${yellow}开始手动检测 Xray（只读，不会重启服务）${plain}"
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        LOGE "未发现 Xray 进程"
+        result=1
+    else
+        for pid in "${pids[@]}"; do
+            process_state=$(awk '{print $3}' "/proc/${pid}/stat" 2>/dev/null || echo "?")
+            case "${process_state}" in
+            D)
+                LOGE "发现 Xray 进程 PID ${pid}，状态 D（不可中断睡眠）"
+                result=1
+                ;;
+            Z)
+                LOGE "发现 Xray 进程 PID ${pid}，状态 Z（僵尸进程）"
+                result=1
+                ;;
+            *)
+                LOGI "发现 Xray 进程 PID ${pid}，状态 ${process_state}"
+                ;;
+            esac
+        done
+
+        if command -v ss >/dev/null 2>&1; then
+            pid_pattern=$(IFS='|'; printf '%s' "${pids[*]}")
+            listener_output=$(ss -lntup 2>/dev/null | grep -E "pid=(${pid_pattern})," || true)
+            if [[ -n "${listener_output}" ]]; then
+                echo "Xray 监听端口："
+                echo "${listener_output}"
+            else
+                LOGD "ss 未显示 Xray 监听端口；请结合下方 API 检测结果判断"
+            fi
+        else
+            LOGD "系统未安装 ss，跳过监听端口检查"
+        fi
+    fi
+
+    for xray_binary in /usr/local/x-ui/bin/xray-linux-*; do
+        if [[ -x "${xray_binary}" ]]; then
+            break
+        fi
+        xray_binary=""
+    done
+
+    if [[ -z "${xray_binary}" ]]; then
+        LOGD "未找到 Xray 可执行文件，跳过本机 API 检测"
+        [[ ${result} -eq 0 ]] && result=2
+    elif ! command -v timeout >/dev/null 2>&1; then
+        LOGD "系统未安装 timeout，跳过有时限的本机 API 检测"
+        [[ ${result} -eq 0 ]] && result=2
+    elif timeout 5 "${xray_binary}" api statsquery --server="${api_address}" >/dev/null 2>&1; then
+        LOGI "Xray 本机 API ${api_address} 有响应"
+        api_result=0
+    else
+        LOGD "Xray 本机 API ${api_address} 未确认响应；API 可能未启用或地址不同"
+        [[ ${result} -eq 0 ]] && result=2
+    fi
+
+    if [[ ${#pids[@]} -eq 0 ]]; then
+        LOGE "检测结论：当前未发现 Xray 进程"
+    elif [[ ${result} -eq 1 ]]; then
+        LOGE "检测结论：发现 Xray 进程异常状态，请查看服务日志"
+    elif [[ ${api_result} -eq 0 ]]; then
+        LOGI "检测结论：Xray 进程存在且本机 API 可响应"
+    else
+        LOGD "检测结论：Xray 进程存在，但本机 API 状态未确认"
+    fi
+    echo "此检测不验证真实客户端连接和端到端数据传输。"
+
+    if [[ $# -eq 0 ]]; then
+        before_show_menu
+    fi
+    return "${result}"
 }
 
 firewall_menu() {
@@ -1385,6 +1484,7 @@ show_usage() {
     echo -e "x-ui stop         - 停止服务"
     echo -e "x-ui restart      - 重启服务"
     echo -e "x-ui restart-xray - 重启xray服务"
+    echo -e "x-ui check-xray [api-address] - 手动检测xray状态"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 设置开机启动"
@@ -1434,9 +1534,10 @@ show_menu() {
   ${green}24.${plain} BBR功能
   ${green}25.${plain} 更新Geo文件
   ${green}26.${plain} 速度测试(Ookla)
+  ${green}27.${plain} 手动检测Xray状态
 "
     show_status
-    echo && read -p "请输入选项[0-26]: " num
+    echo && read -p "请输入选项[0-27]: " num
 
     case "${num}" in
     0)
@@ -1520,8 +1621,11 @@ show_menu() {
     26)
         run_speedtest
         ;;
+    27)
+        check_install && check_xray_health
+        ;;
     *)
-        LOGE "请输入正确的数字 [0-26]"
+        LOGE "请输入正确的数字 [0-27]"
         ;;
     esac
 }
@@ -1569,6 +1673,9 @@ if [[ $# > 0 ]]; then
         ;;
     "restart-xray")
         check_install 0 && restart_xray 0
+        ;;
+    "check-xray")
+        check_install 0 && check_xray_health "${2:-}"
         ;;
     *) show_usage ;;
     esac
