@@ -634,6 +634,7 @@ uninstall_locked() {
 
 reset_user() {
     local restart_after=0
+    local result=0
 
     confirm "您确定要重置面板用户名和密码吗?" "n"
     if [[ $? != 0 ]]; then
@@ -643,14 +644,18 @@ reset_user() {
         return 0
     fi
     read -rp "请设置登录用户名 [默认用户名系统随机生成]: " config_account
-    [[ -z $config_account ]] && config_account=$(date +%s%N | md5sum | cut -c 1-8)
+    [[ -z $config_account ]] && config_account=$(gen_random_string 10)
     read -rp "请设置登录密码 [默认密码系统随机生成]: " config_password
-    [[ -z $config_password ]] && config_password=$(date +%s%N | md5sum | cut -c 1-8)
+    [[ -z $config_password ]] && config_password=$(gen_random_string 10)
     confirm "立即重启面板以应用新凭据吗?" "y" && restart_after=1
-    with_maintenance_lock reset_user_locked "${config_account}" "${config_password}" "${restart_after}" || return 1
+    if ! with_maintenance_lock reset_user_locked "${config_account}" "${config_password}" "${restart_after}"; then
+        LOGE "重置凭据流程未完全成功，请检查上方错误信息"
+        result=1
+    fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "${result}"
 }
 
 reset_user_locked() {
@@ -658,11 +663,17 @@ reset_user_locked() {
     local password="$2"
     local restart_after="$3"
 
-    /usr/local/x-ui/x-ui setting -username "${account}" -password "${password}" >/dev/null 2>&1 || return 1
-    /usr/local/x-ui/x-ui setting -remove_secret >/dev/null 2>&1 || return 1
+    /usr/local/x-ui/x-ui setting -username "${account}" -password "${password}" || {
+        LOGE "设置新用户名和密码失败"
+        return 1
+    }
     echo -e "面板登录用户名已重置为: ${green} ${account} ${plain}"
     echo -e "面板登录密码已重置为: ${green} ${password} ${plain}"
-    echo -e "${yellow} 面板登录秘密令牌已禁用 ${plain}"
+    if /usr/local/x-ui/x-ui setting -remove_secret; then
+        echo -e "${yellow} 面板登录秘密令牌已禁用 ${plain}"
+    else
+        LOGE "新凭据已设置，但清除面板秘密令牌失败；请检查上方错误信息"
+    fi
     echo -e "${green} 请使用新的登录用户名和密码访问 X-UI 面板请记住它们! ${plain}"
     if [[ "${restart_after}" == "1" ]]; then
         restart_locked
@@ -700,6 +711,8 @@ reset_webbasepath_locked() {
 }
 
 reset_config() {
+    local result=0
+
     confirm "您确定要重置所有面板设置吗?账户数据不会丢失, 用户名和密码不会改变" "n"
     if [[ $? != 0 ]]; then
         if [[ $# == 0 ]]; then
@@ -707,10 +720,14 @@ reset_config() {
         fi
         return 0
     fi
-    with_maintenance_lock reset_config_locked || return 1
+    if ! with_maintenance_lock reset_config_locked; then
+        LOGE "配置重置流程未完全成功，请检查上方错误信息"
+        result=1
+    fi
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
+    return "${result}"
 }
 
 reset_config_locked() {
@@ -845,7 +862,11 @@ restart_locked() {
     rm -f "${watchdog_cooldown_file}"
     if service_restart && service_wait_started; then
         watchdog_set_cooldown || true
-        LOGI "x-ui和xray重启成功"
+        if wait_xray_process 5; then
+            LOGI "x-ui和xray重启成功"
+        else
+            LOGE "x-ui服务已重启，但 5 秒内未发现 Xray 进程，请检查面板日志和节点配置"
+        fi
     else
         LOGE "面板重启失败，停止或启动阶段未成功"
         result=1
@@ -1088,6 +1109,18 @@ show_enable_status() {
 
 check_xray_status() {
     xray_process_ids | grep -q .
+}
+
+wait_xray_process() {
+    local timeout="${1:-5}"
+    local elapsed=0
+
+    while (( elapsed < timeout )); do
+        check_xray_status && return 0
+        sleep 1
+        ((elapsed++))
+    done
+    check_xray_status
 }
 
 show_xray_status() {
