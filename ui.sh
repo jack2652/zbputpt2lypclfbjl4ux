@@ -11,6 +11,7 @@ distro=""
 service_manager=""
 service_file=""
 maintenance_lock_file="/run/x-ui-xray-watchdog.lock"
+maintenance_request_dir="/run/x-ui-maintenance-requests"
 watchdog_paused_file="/run/x-ui-xray-watchdog.paused"
 watchdog_cooldown_file="/run/x-ui-xray-watchdog.cooldown"
 maintenance_lock_depth=0
@@ -33,6 +34,8 @@ with_maintenance_lock() {
     local status=0
     local previous_lock_state="${XUI_MAINTENANCE_LOCK_HELD:-0}"
     local flock_bin=""
+    local process_start=""
+    local request_marker=""
 
     if (( maintenance_lock_depth > 0 )) || [[ "${previous_lock_state}" == "1" ]]; then
         "$@"
@@ -44,15 +47,34 @@ with_maintenance_lock() {
         LOGE "未找到 flock，无法安全执行 x-ui 维护操作"
         return 1
     fi
+    mkdir -p "${maintenance_request_dir}" || {
+        LOGE "无法创建维护请求目录 ${maintenance_request_dir}"
+        return 1
+    }
+    process_start=$(process_start_time "${BASHPID}") || {
+        LOGE "无法识别当前进程，维护操作已取消"
+        return 1
+    }
+    request_marker="${maintenance_request_dir}/${BASHPID}.${process_start}"
+    printf '%s\n' "${BASHPID}" > "${request_marker}" || {
+        LOGE "无法登记维护请求，维护操作已取消"
+        return 1
+    }
     if ! exec {lock_fd}>"${maintenance_lock_file}"; then
+        rm -f "${request_marker}"
         LOGE "无法打开 x-ui 维护锁 ${maintenance_lock_file}"
         return 1
     fi
-    if ! "${flock_bin}" -x "${lock_fd}"; then
-        LOGE "获取 x-ui 维护锁失败"
-        exec {lock_fd}>&-
-        return 1
+    if ! "${flock_bin}" -n "${lock_fd}"; then
+        LOGI "watchdog 或其他维护操作正在使用维护锁，等待其到达安全退出点..."
+        if ! "${flock_bin}" -x "${lock_fd}"; then
+            rm -f "${request_marker}"
+            exec {lock_fd}>&-
+            LOGE "获取 x-ui 维护锁失败"
+            return 1
+        fi
     fi
+    rm -f "${request_marker}"
 
     maintenance_lock_depth=1
     export XUI_MAINTENANCE_LOCK_HELD=1
@@ -66,6 +88,51 @@ with_maintenance_lock() {
     "${flock_bin}" -u "${lock_fd}" || true
     exec {lock_fd}>&-
     return "${status}"
+}
+
+process_start_time() {
+    local pid="$1"
+    local stat=""
+    local stat_fields=()
+
+    IFS= read -r stat < "/proc/${pid}/stat" 2>/dev/null || return 1
+    stat="${stat##*) }"
+    read -r -a stat_fields <<< "${stat}"
+    [[ "${stat_fields[0]:-}" != "Z" ]] || return 1
+    [[ "${stat_fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${stat_fields[19]}"
+}
+
+maintenance_requests_pending() {
+    local request_marker=""
+    local request_id=""
+    local request_pid=""
+    local expected_start=""
+    local actual_start=""
+
+    for request_marker in "${maintenance_request_dir}"/*; do
+        [[ -f "${request_marker}" ]] || continue
+        request_id="${request_marker##*/}"
+        request_pid="${request_id%%.*}"
+        expected_start="${request_id#*.}"
+        if [[ "${request_pid}" =~ ^[1-9][0-9]*$ && "${expected_start}" =~ ^[0-9]+$ ]] && \
+            kill -0 "${request_pid}" 2>/dev/null; then
+            actual_start=$(process_start_time "${request_pid}" || true)
+            if [[ "${actual_start}" == "${expected_start}" ]]; then
+                return 0
+            fi
+        fi
+        rm -f "${request_marker}"
+    done
+    return 1
+}
+
+watchdog_yield_to_maintenance() {
+    if maintenance_requests_pending; then
+        LOGI "检测到人工维护请求，结束本轮自动恢复并释放维护锁"
+        return 0
+    fi
+    return 1
 }
 
 watchdog_set_cooldown() {
@@ -1155,7 +1222,12 @@ watchdog_xray() {
     local attempt=0
     local now=""
     local last_attempt=""
+    local wait_elapsed=0
+    local service_started=0
 
+    if watchdog_yield_to_maintenance; then
+        return 0
+    fi
     if [[ -e "${watchdog_paused_file}" ]]; then
         return 0
     fi
@@ -1165,6 +1237,9 @@ watchdog_xray() {
         return 0
     else
         api_status=$?
+    fi
+    if watchdog_yield_to_maintenance; then
+        return 0
     fi
     if [[ ${api_status} -eq 2 ]]; then
         LOGE "Xray API 检测依赖不可用，无法自动判断健康状态"
@@ -1181,31 +1256,83 @@ watchdog_xray() {
 
     LOGE "Xray API ${api_address} 无响应，先尝试重载 Xray"
     if service_reload; then
-        sleep 5
+        if watchdog_yield_to_maintenance; then
+            return 0
+        fi
+        for ((wait_elapsed = 0; wait_elapsed < 5; wait_elapsed++)); do
+            if watchdog_yield_to_maintenance; then
+                return 0
+            fi
+            sleep 1
+        done
+        if watchdog_yield_to_maintenance; then
+            return 0
+        fi
         if xray_api_check "${api_address}"; then
             rm -f "${watchdog_cooldown_file}"
             LOGI "Xray 重载后 API 已恢复"
+            return 0
+        elif watchdog_yield_to_maintenance; then
             return 0
         fi
     else
         LOGE "向 x-ui 发送 Xray 重载信号失败"
     fi
 
+    if watchdog_yield_to_maintenance; then
+        return 0
+    fi
     LOGE "Xray 重载后 API 仍无响应，开始重启 x-ui 服务"
-    if ! service_restart; then
-        LOGE "x-ui 服务重启失败，Xray API 仍未恢复"
-    elif ! service_wait_started; then
-        LOGE "x-ui 服务未能在超时内启动，Xray API 仍未恢复"
-    else
-        for ((attempt = 1; attempt <= 5; attempt++)); do
-            if xray_api_check "${api_address}"; then
-                rm -f "${watchdog_cooldown_file}"
-                LOGI "x-ui 服务重启后 Xray API 已恢复"
+    if service_restart; then
+        if watchdog_yield_to_maintenance; then
+            return 0
+        fi
+        for ((wait_elapsed = 0; wait_elapsed < service_start_timeout; wait_elapsed++)); do
+            if watchdog_yield_to_maintenance; then
                 return 0
             fi
-            [[ ${attempt} -lt 5 ]] && sleep 3
+            if check_status; then
+                service_started=1
+                break
+            fi
+            sleep 1
         done
-        LOGE "x-ui 服务重启后 Xray API 仍无响应，请检查服务日志"
+        if watchdog_yield_to_maintenance; then
+            return 0
+        fi
+        if [[ ${service_started} -eq 0 ]] && check_status; then
+            service_started=1
+        fi
+        if [[ ${service_started} -eq 0 ]]; then
+            LOGE "x-ui 服务未能在超时内启动，Xray API 仍未恢复"
+        else
+            for ((attempt = 1; attempt <= 5; attempt++)); do
+                if watchdog_yield_to_maintenance; then
+                    return 0
+                fi
+                if xray_api_check "${api_address}"; then
+                    rm -f "${watchdog_cooldown_file}"
+                    LOGI "x-ui 服务重启后 Xray API 已恢复"
+                    return 0
+                elif watchdog_yield_to_maintenance; then
+                    return 0
+                fi
+                if [[ ${attempt} -lt 5 ]]; then
+                    for ((wait_elapsed = 0; wait_elapsed < 3; wait_elapsed++)); do
+                        if watchdog_yield_to_maintenance; then
+                            return 0
+                        fi
+                        sleep 1
+                    done
+                fi
+            done
+            LOGE "x-ui 服务重启后 Xray API 仍无响应，请检查服务日志"
+        fi
+    else
+        if watchdog_yield_to_maintenance; then
+            return 0
+        fi
+        LOGE "x-ui 服务重启失败，Xray API 仍未恢复"
     fi
 
     [[ "${now}" =~ ^[0-9]+$ ]] && printf '%s\n' "${now}" > "${watchdog_cooldown_file}"
