@@ -465,7 +465,9 @@ uninstall() {
       fi
       if [[ "${distro}" == "alpine" ]]; then
           sed -i '/x-ui restart-xray/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/x-ui watchdog-xray/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Auto restart xray daily at 3:30 AM/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Xray API health check every minute/d' /etc/crontabs/root 2>/dev/null || true
       else
           rm -f /etc/cron.d/x-ui
       fi
@@ -890,15 +892,36 @@ xray_process_ids() {
     done
 }
 
-check_xray_health() {
+xray_binary_path() {
+    local candidate=""
+
+    for candidate in /usr/local/x-ui/bin/xray-linux-*; do
+        if [[ -x "${candidate}" ]]; then
+            printf '%s\n' "${candidate}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+xray_api_check() {
     local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
     local xray_binary=""
+
+    xray_binary=$(xray_binary_path) || return 2
+    command -v timeout >/dev/null 2>&1 || return 2
+    timeout 5 "${xray_binary}" api statsquery --server="${api_address}" >/dev/null 2>&1
+}
+
+check_xray_health() {
+    local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
     local pid=""
     local process_state=""
     local pid_pattern=""
     local listener_output=""
     local result=0
     local api_result=2
+    local api_status=0
     local -a pids=()
 
     while IFS= read -r pid; do
@@ -941,24 +964,16 @@ check_xray_health() {
         fi
     fi
 
-    for xray_binary in /usr/local/x-ui/bin/xray-linux-*; do
-        if [[ -x "${xray_binary}" ]]; then
-            break
-        fi
-        xray_binary=""
-    done
-
-    if [[ -z "${xray_binary}" ]]; then
-        LOGD "未找到 Xray 可执行文件，跳过本机 API 检测"
-        [[ ${result} -eq 0 ]] && result=2
-    elif ! command -v timeout >/dev/null 2>&1; then
-        LOGD "系统未安装 timeout，跳过有时限的本机 API 检测"
-        [[ ${result} -eq 0 ]] && result=2
-    elif timeout 5 "${xray_binary}" api statsquery --server="${api_address}" >/dev/null 2>&1; then
+    if xray_api_check "${api_address}"; then
         LOGI "Xray 本机 API ${api_address} 有响应"
         api_result=0
     else
-        LOGD "Xray 本机 API ${api_address} 未确认响应；API 可能未启用或地址不同"
+        api_status=$?
+        if [[ ${api_status} -eq 2 ]]; then
+            LOGD "未找到 Xray 可执行文件或 timeout，跳过本机 API 检测"
+        else
+            LOGD "Xray 本机 API ${api_address} 未确认响应；API 可能未启用或地址不同"
+        fi
         [[ ${result} -eq 0 ]] && result=2
     fi
 
@@ -977,6 +992,66 @@ check_xray_health() {
         before_show_menu
     fi
     return "${result}"
+}
+
+watchdog_xray() {
+    local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
+    local cooldown_file="/run/x-ui-xray-watchdog.cooldown"
+    local api_status=0
+    local attempt=0
+    local now=""
+    local last_attempt=""
+
+    if xray_api_check "${api_address}"; then
+        rm -f "${cooldown_file}"
+        return 0
+    else
+        api_status=$?
+    fi
+    if [[ ${api_status} -eq 2 ]]; then
+        LOGE "Xray API 检测依赖不可用，无法自动判断健康状态"
+        return 2
+    fi
+
+    now=$(date +%s)
+    last_attempt=$(cat "${cooldown_file}" 2>/dev/null || true)
+    if [[ "${now}" =~ ^[0-9]+$ && "${last_attempt}" =~ ^[0-9]+$ ]] && \
+        (( now >= last_attempt && now - last_attempt < 300 )); then
+        LOGD "Xray API 仍无响应，最近一次恢复失败不足 5 分钟，暂不重复重启"
+        return 1
+    fi
+
+    LOGE "Xray API ${api_address} 无响应，先尝试重载 Xray"
+    if service_reload; then
+        sleep 5
+        if xray_api_check "${api_address}"; then
+            rm -f "${cooldown_file}"
+            LOGI "Xray 重载后 API 已恢复"
+            return 0
+        fi
+    else
+        LOGE "向 x-ui 发送 Xray 重载信号失败"
+    fi
+
+    LOGE "Xray 重载后 API 仍无响应，开始重启 x-ui 服务"
+    if ! service_restart; then
+        LOGE "x-ui 服务重启失败，Xray API 仍未恢复"
+    elif ! service_wait_started; then
+        LOGE "x-ui 服务未能在超时内启动，Xray API 仍未恢复"
+    else
+        for ((attempt = 1; attempt <= 5; attempt++)); do
+            if xray_api_check "${api_address}"; then
+                rm -f "${cooldown_file}"
+                LOGI "x-ui 服务重启后 Xray API 已恢复"
+                return 0
+            fi
+            [[ ${attempt} -lt 5 ]] && sleep 3
+        done
+        LOGE "x-ui 服务重启后 Xray API 仍无响应，请检查服务日志"
+    fi
+
+    [[ "${now}" =~ ^[0-9]+$ ]] && printf '%s\n' "${now}" > "${cooldown_file}"
+    return 1
 }
 
 firewall_menu() {
@@ -1485,6 +1560,7 @@ show_usage() {
     echo -e "x-ui restart      - 重启服务"
     echo -e "x-ui restart-xray - 重启xray服务"
     echo -e "x-ui check-xray [api-address] - 手动检测xray状态"
+    echo -e "x-ui watchdog-xray [api-address] - 检测并自动恢复xray"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 设置开机启动"
@@ -1676,6 +1752,9 @@ if [[ $# > 0 ]]; then
         ;;
     "check-xray")
         check_install 0 && check_xray_health "${2:-}"
+        ;;
+    "watchdog-xray")
+        check_install 0 && watchdog_xray "${2:-}"
         ;;
     *) show_usage ;;
     esac

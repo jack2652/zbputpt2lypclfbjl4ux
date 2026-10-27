@@ -72,12 +72,12 @@ install_base() {
     if [[ "${distro}" == "alpine" ]]; then
         if ! apk add --no-cache --update \
             ca-certificates tzdata bash curl wget tar gzip coreutils openssl \
-            util-linux-misc socat procps-ng kmod; then
+            util-linux util-linux-misc socat procps-ng kmod; then
             echo -e "${red}安装 Alpine 依赖失败${plain}"
             exit 1
         fi
         if ! apk add --no-cache cronie; then
-            echo -e "${yellow}警告：未能安装 cronie，已跳过 Xray 自动重启定时任务${plain}"
+            echo -e "${yellow}警告：未能安装 cronie，已跳过 Xray API 定时检测${plain}"
         fi
         if ! apk add --no-cache fail2ban; then
             echo -e "${yellow}警告：未能安装 fail2ban，面板核心功能仍可使用，但 Fail2ban 菜单不可用${plain}"
@@ -338,32 +338,54 @@ config_after_install() {
     /usr/local/x-ui/x-ui migrate
 }
 
-setup_xray_auto_restart() {
+setup_xray_watchdog() {
     local cron_file=""
     local cron_line=""
+    local cron_command=""
+    local log_file="/var/log/x-ui-xray-watchdog.log"
+    local flock_bin=""
 
-    echo -e "${yellow}配置 Xray 自动重启定时任务...${plain}"
+    echo -e "${yellow}配置 Xray API 每分钟健康检测...${plain}"
     if [[ "${distro}" == "alpine" ]]; then
         if ! command -v crond >/dev/null 2>&1; then
-            echo -e "${yellow}未找到 crond，跳过 Xray 自动重启定时任务${plain}"
+            echo -e "${yellow}未找到 crond，跳过 Xray API 定时检测${plain}"
             return 0
         fi
         cron_file="/etc/crontabs/root"
-        cron_line="30 3 * * * /usr/bin/x-ui restart-xray >/dev/null 2>&1"
         mkdir -p /etc/crontabs
     else
         cron_file="/etc/cron.d/x-ui"
-        cron_line="30 3 * * * root /usr/bin/x-ui restart-xray >/dev/null 2>&1"
         mkdir -p /etc/cron.d
     fi
 
-    if ! grep -Fq "x-ui restart-xray" "${cron_file}" 2>/dev/null; then
-        {
-            echo "# Auto restart xray daily at 3:30 AM"
-            echo "${cron_line}"
-        } >> "${cron_file}"
+    flock_bin=$(command -v flock 2>/dev/null || true)
+    if [[ -z "${flock_bin}" ]]; then
+        echo -e "${yellow}未找到 flock，跳过 Xray API 定时检测${plain}"
+        return 0
     fi
+
+    cron_command="output=\$(/usr/bin/x-ui watchdog-xray 2>&1); status=\$?; if [ -n \"\$output\" ]; then { if [ -f ${log_file} ]; then tail -n 49 ${log_file}; fi; echo \"\$output\"; } | tail -n 50 > ${log_file}.tmp && mv ${log_file}.tmp ${log_file}; fi; exit \$status"
+    if [[ "${distro}" == "alpine" ]]; then
+        cron_line="* * * * * ${flock_bin} -n /run/x-ui-xray-watchdog.lock /bin/sh -c '${cron_command}'"
+    else
+        cron_line="* * * * * root ${flock_bin} -n /run/x-ui-xray-watchdog.lock /bin/sh -c '${cron_command}'"
+    fi
+
+    if [[ -f "${cron_file}" ]]; then
+        sed -i '/x-ui restart-xray/d' "${cron_file}"
+        sed -i '/x-ui watchdog-xray/d' "${cron_file}"
+        sed -i '/Auto restart xray daily at 3:30 AM/d' "${cron_file}"
+        sed -i '/Xray API health check every minute/d' "${cron_file}"
+    fi
+    {
+        echo "# Xray API health check every minute"
+        echo "${cron_line}"
+    } >> "${cron_file}"
     chmod 644 "${cron_file}"
+
+    if [[ -f "${log_file}" ]]; then
+        "${flock_bin}" /run/x-ui-xray-watchdog.lock /bin/sh -c "tail -n 50 '${log_file}' > '${log_file}.tmp' && mv '${log_file}.tmp' '${log_file}'"
+    fi
 
     if [[ "${distro}" == "alpine" ]]; then
         rc-update add crond default >/dev/null 2>&1 || true
@@ -375,7 +397,7 @@ setup_xray_auto_restart() {
         service cron start >/dev/null 2>&1 || true
     fi
 
-    echo -e "${green}Xray 自动重启任务配置完成${plain}"
+    echo -e "${green}Xray API 每分钟健康检测配置完成${plain}"
 }
 
 install_x_ui() {
@@ -486,11 +508,11 @@ install_x_ui() {
         echo -e "${red}注册或启动 x-ui 服务失败${plain}"
         exit 1
     fi
-    setup_xray_auto_restart
+    setup_xray_watchdog
 
     echo -e "${green}x-ui ${tag_version} 安装完成, 运行中...${plain}"
     echo -e ""
-    echo -e "x-ui 子命令: start / stop / restart / restart-xray / status / settings / update / uninstall"
+    echo -e "x-ui 子命令: start / stop / restart / restart-xray / check-xray / watchdog-xray / status / settings / update / uninstall"
 }
 
 detect_platform
