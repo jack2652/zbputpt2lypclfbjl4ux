@@ -11,7 +11,9 @@ distro=""
 service_manager=""
 service_file=""
 maintenance_lock_file="/run/x-ui-xray-watchdog.lock"
+maintenance_lock_owner_file="/run/x-ui-xray-watchdog.lock.owner"
 maintenance_request_dir="/run/x-ui-maintenance-requests"
+maintenance_lock_release_timeout=1
 watchdog_paused_file="/run/x-ui-xray-watchdog.paused"
 watchdog_cooldown_file="/run/x-ui-xray-watchdog.cooldown"
 maintenance_lock_depth=0
@@ -36,6 +38,11 @@ with_maintenance_lock() {
     local flock_bin=""
     local process_start=""
     local request_marker=""
+    local owner_operation="${1:-maintenance}"
+    local owner_file_tmp=""
+    local recorded_pid=""
+    local recorded_start=""
+    local recorded_operation=""
 
     if (( maintenance_lock_depth > 0 )) || [[ "${previous_lock_state}" == "1" ]]; then
         "$@"
@@ -66,15 +73,35 @@ with_maintenance_lock() {
         return 1
     fi
     if ! "${flock_bin}" -n "${lock_fd}"; then
-        LOGI "watchdog 或其他维护操作正在使用维护锁，等待其到达安全退出点..."
-        if ! "${flock_bin}" -x "${lock_fd}"; then
+        if [[ "${owner_operation}" == "watchdog_xray" ]]; then
             rm -f "${request_marker}"
             exec {lock_fd}>&-
-            LOGE "获取 x-ui 维护锁失败"
+            LOGD "人工维护操作正在使用维护锁，跳过本轮 Xray 自动检测"
+            return 0
+        fi
+        if ! maintenance_preempt_lock_holder; then
+            rm -f "${request_marker}"
+            exec {lock_fd}>&-
+            return 1
+        fi
+        if ! "${flock_bin}" -w "${maintenance_lock_release_timeout}" -x "${lock_fd}"; then
+            rm -f "${request_marker}"
+            exec {lock_fd}>&-
+            LOGE "已终止原维护进程，但 ${maintenance_lock_release_timeout} 秒内未能取得维护锁"
             return 1
         fi
     fi
     rm -f "${request_marker}"
+
+    owner_file_tmp="${maintenance_lock_owner_file}.${BASHPID}"
+    if ! printf '%s %s %s\n' "${BASHPID}" "${process_start}" "${owner_operation}" > "${owner_file_tmp}" || \
+        ! mv -f "${owner_file_tmp}" "${maintenance_lock_owner_file}"; then
+        rm -f "${owner_file_tmp}"
+        "${flock_bin}" -u "${lock_fd}" || true
+        exec {lock_fd}>&-
+        LOGE "无法记录 x-ui 维护锁持有者信息，操作已取消"
+        return 1
+    fi
 
     maintenance_lock_depth=1
     export XUI_MAINTENANCE_LOCK_HELD=1
@@ -85,9 +112,144 @@ with_maintenance_lock() {
     else
         unset XUI_MAINTENANCE_LOCK_HELD
     fi
+    if [[ -r "${maintenance_lock_owner_file}" ]]; then
+        read -r recorded_pid recorded_start recorded_operation < "${maintenance_lock_owner_file}"
+        if [[ "${recorded_pid}" == "${BASHPID}" && "${recorded_start}" == "${process_start}" ]]; then
+            rm -f "${maintenance_lock_owner_file}"
+        fi
+    fi
     "${flock_bin}" -u "${lock_fd}" || true
     exec {lock_fd}>&-
     return "${status}"
+}
+
+maintenance_lock_find_processes() {
+    local owner_pid=""
+    local owner_start=""
+    local owner_operation=""
+    local actual_start=""
+    local stat_output=""
+    local device_number=""
+    local inode=""
+    local device_major=""
+    local device_minor=""
+    local target_device_inode=""
+    local lock_line=""
+    local lock_fields=()
+    local lock_type_index=0
+    local lock_pid_index=0
+    local lock_device_index=0
+    local lock_pid=""
+    local lock_device_inode=""
+    local -A seen_pids=()
+
+    if [[ -r "${maintenance_lock_owner_file}" ]]; then
+        read -r owner_pid owner_start owner_operation < "${maintenance_lock_owner_file}"
+        if [[ "${owner_pid}" =~ ^[1-9][0-9]*$ && "${owner_start}" =~ ^[0-9]+$ ]]; then
+            actual_start=$(process_start_time "${owner_pid}" || true)
+            if [[ "${actual_start}" == "${owner_start}" && "${owner_pid}" != "${BASHPID}" ]]; then
+                printf '%s %s\n' "${owner_pid}" "${owner_start}"
+                seen_pids["${owner_pid}"]=1
+            fi
+        fi
+    fi
+
+    [[ -r /proc/locks ]] || return 0
+    stat_output=$(stat -c '%d %i' "${maintenance_lock_file}" 2>/dev/null) || return 0
+    read -r device_number inode <<< "${stat_output}"
+    [[ "${device_number}" =~ ^[0-9]+$ && "${inode}" =~ ^[0-9]+$ ]] || return 0
+    device_major=$(( ((device_number >> 8) & 0xfff) | ((device_number >> 32) & ~0xfff) ))
+    device_minor=$(( (device_number & 0xff) | ((device_number >> 12) & 0xffffff00) ))
+    printf -v target_device_inode '%02x:%02x:%s' "${device_major}" "${device_minor}" "${inode}"
+
+    while IFS= read -r lock_line; do
+        read -r -a lock_fields <<< "${lock_line}"
+        lock_type_index=1
+        if [[ "${lock_fields[1]:-}" == "->" ]]; then
+            lock_type_index=2
+        fi
+        [[ "${lock_fields[${lock_type_index}]:-}" == "FLOCK" ]] || continue
+        lock_pid_index=$((lock_type_index + 3))
+        lock_device_index=$((lock_type_index + 4))
+        lock_pid="${lock_fields[${lock_pid_index}]:-}"
+        lock_device_inode="${lock_fields[${lock_device_index}]:-}"
+        [[ "${lock_device_inode}" == "${target_device_inode}" && "${lock_pid}" =~ ^[1-9][0-9]*$ ]] || continue
+        [[ "${lock_pid}" != "${BASHPID}" && -z "${seen_pids[${lock_pid}]:-}" ]] || continue
+        actual_start=$(process_start_time "${lock_pid}" || true)
+        [[ "${actual_start}" =~ ^[0-9]+$ ]] || continue
+        printf '%s %s\n' "${lock_pid}" "${actual_start}"
+        seen_pids["${lock_pid}"]=1
+    done < /proc/locks
+}
+
+maintenance_kill_process_tree() {
+    local pid="$1"
+    local expected_start="${2:-}"
+    local actual_start=""
+    local children=()
+    local child=""
+    local child_start=""
+
+    [[ "${pid}" =~ ^[1-9][0-9]*$ && "${pid}" != "${BASHPID}" ]] || return 1
+    actual_start=$(process_start_time "${pid}" || true)
+    [[ "${actual_start}" =~ ^[0-9]+$ ]] || return 0
+    if [[ -n "${expected_start}" && "${actual_start}" != "${expected_start}" ]]; then
+        return 0
+    fi
+    expected_start="${actual_start}"
+
+    if [[ -r "/proc/${pid}/task/${pid}/children" ]]; then
+        read -r -a children < "/proc/${pid}/task/${pid}/children"
+        for child in "${children[@]}"; do
+            child_start=$(process_start_time "${child}" || true)
+            [[ "${child_start}" =~ ^[0-9]+$ ]] || continue
+            maintenance_kill_process_tree "${child}" "${child_start}" || true
+        done
+    fi
+
+    actual_start=$(process_start_time "${pid}" || true)
+    [[ "${actual_start}" == "${expected_start}" ]] || return 0
+    kill -KILL "${pid}" 2>/dev/null || return 1
+}
+
+maintenance_preempt_lock_holder() {
+    local holder_pid=""
+    local holder_start=""
+    local owner_pid=""
+    local owner_start=""
+    local owner_operation="未知操作"
+    local actual_start=""
+    local killed_count=0
+    local holder=""
+    local -a holders=()
+
+    if [[ -r "${maintenance_lock_owner_file}" ]]; then
+        read -r owner_pid owner_start owner_operation < "${maintenance_lock_owner_file}"
+        actual_start=$(process_start_time "${owner_pid}" || true)
+        if [[ ! "${owner_pid}" =~ ^[1-9][0-9]*$ || "${actual_start}" != "${owner_start}" ]]; then
+            owner_operation="旧版维护操作"
+        fi
+    fi
+    [[ -n "${owner_operation}" ]] || owner_operation="未知操作"
+    mapfile -t holders < <(maintenance_lock_find_processes)
+    if [[ ${#holders[@]} -eq 0 ]]; then
+        LOGE "维护锁被占用，但无法准确识别持有者，拒绝盲目结束进程"
+        return 1
+    fi
+
+    LOGI "手动维护操作优先：强制结束占用维护锁的 ${owner_operation} 进程"
+    for holder in "${holders[@]}"; do
+        read -r holder_pid holder_start <<< "${holder}"
+        [[ "${holder_pid}" =~ ^[1-9][0-9]*$ && "${holder_start}" =~ ^[0-9]+$ ]] || continue
+        if maintenance_kill_process_tree "${holder_pid}" "${holder_start}"; then
+            killed_count=$((killed_count + 1))
+        fi
+    done
+    if (( killed_count == 0 )); then
+        LOGE "未能结束维护锁持有进程，当前操作已取消"
+        return 1
+    fi
+    return 0
 }
 
 process_start_time() {
@@ -289,6 +451,7 @@ service_wait_started() {
     local timeout="${1:-${service_start_timeout}}"
     local elapsed=0
 
+    LOGD "等待 x-ui 服务状态就绪，最多 ${timeout} 秒"
     while (( elapsed < timeout )); do
         check_status
         if [[ $? == 0 ]]; then
@@ -374,10 +537,11 @@ service_stop_with_fallback() {
     if [[ -n "${pid}" ]] && service_is_xui_process "${pid}"; then
         pid_is_xui=0
     fi
+    LOGI "请求服务管理器停止 x-ui..."
     service_stop || true
 
     if [[ "${pid_is_xui}" == 0 ]]; then
-        if service_wait_process_exit "${pid}" "${service_stop_timeout}"; then
+        if ! service_is_xui_process "${pid}"; then
             if service_wait_stopped 5; then
                 service_clear_pid_file "${pid}"
                 return 0
@@ -405,6 +569,7 @@ service_stop_with_fallback() {
 
 service_restart() {
     service_stop_with_fallback || return 1
+    LOGI "请求服务管理器启动 x-ui..."
     service_start
 }
 
@@ -556,7 +721,8 @@ update_menu_locked() {
     if [[ -f "${cron_file}" ]]; then
         sed -i \
             -e '/x-ui watchdog-xray/ s|^\* \* \* \* \*|*/5 * * * *|' \
-            -e '/x-ui watchdog-xray/ s|$(/usr/bin/x-ui watchdog-xray|$(XUI_MAINTENANCE_LOCK_HELD=1 /usr/bin/x-ui watchdog-xray|' \
+            -e '/x-ui watchdog-xray/ s|[^ ]*/flock -n /run/x-ui-xray-watchdog.lock ||' \
+            -e '/x-ui watchdog-xray/ s|XUI_MAINTENANCE_LOCK_HELD=1 ||' \
             -e 's/Xray API health check every minute/Xray API health check every 5 minutes/' \
             "${cron_file}"
     fi
@@ -862,6 +1028,7 @@ restart_locked() {
     rm -f "${watchdog_cooldown_file}"
     if service_restart && service_wait_started; then
         watchdog_set_cooldown || true
+        LOGD "检查 Xray 进程是否已启动，最多 5 秒"
         if wait_xray_process 5; then
             LOGI "x-ui和xray重启成功"
         else

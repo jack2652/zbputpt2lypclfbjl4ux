@@ -343,8 +343,6 @@ setup_xray_watchdog() {
     local cron_line=""
     local cron_command=""
     local log_file="/var/log/x-ui-xray-watchdog.log"
-    local flock_bin=""
-    local lock_file="/run/x-ui-xray-watchdog.lock"
 
     echo -e "${yellow}配置 Xray API 每 5 分钟健康检测...${plain}"
     if [[ "${distro}" == "alpine" ]]; then
@@ -359,17 +357,11 @@ setup_xray_watchdog() {
         mkdir -p /etc/cron.d
     fi
 
-    flock_bin=$(command -v flock 2>/dev/null || true)
-    if [[ -z "${flock_bin}" ]]; then
-        echo -e "${yellow}未找到 flock，跳过 Xray API 定时检测${plain}"
-        return 0
-    fi
-
-    cron_command="output=\$(XUI_MAINTENANCE_LOCK_HELD=1 /usr/bin/x-ui watchdog-xray 2>&1); status=\$?; if [ -n \"\$output\" ]; then { if [ -f ${log_file} ]; then tail -n 49 ${log_file}; fi; echo \"\$output\"; } | tail -n 50 > ${log_file}.tmp && mv ${log_file}.tmp ${log_file}; fi; exit \$status"
+    cron_command="output=\$(/usr/bin/x-ui watchdog-xray 2>&1); status=\$?; if [ -n \"\$output\" ]; then { if [ -f ${log_file} ]; then tail -n 49 ${log_file}; fi; echo \"\$output\"; } | tail -n 50 > ${log_file}.tmp && mv ${log_file}.tmp ${log_file}; fi; exit \$status"
     if [[ "${distro}" == "alpine" ]]; then
-        cron_line="*/5 * * * * ${flock_bin} -n ${lock_file} /bin/sh -c '${cron_command}'"
+        cron_line="*/5 * * * * /bin/sh -c '${cron_command}'"
     else
-        cron_line="*/5 * * * * root ${flock_bin} -n ${lock_file} /bin/sh -c '${cron_command}'"
+        cron_line="*/5 * * * * root /bin/sh -c '${cron_command}'"
     fi
 
     if [[ -f "${cron_file}" ]]; then
