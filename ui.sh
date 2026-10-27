@@ -10,6 +10,10 @@ repo_raw_base="https://raw.githubusercontent.com/${repo_owner}/${repo_name}/main
 distro=""
 service_manager=""
 service_file=""
+maintenance_lock_file="/run/x-ui-xray-watchdog.lock"
+watchdog_paused_file="/run/x-ui-xray-watchdog.paused"
+watchdog_cooldown_file="/run/x-ui-xray-watchdog.cooldown"
+maintenance_lock_depth=0
 
 #Add some basic function here
 function LOGD() {
@@ -22,6 +26,53 @@ function LOGE() {
 
 function LOGI() {
     echo -e "${green}[INF] $* ${plain}"
+}
+
+with_maintenance_lock() {
+    local lock_fd=""
+    local status=0
+    local previous_lock_state="${XUI_MAINTENANCE_LOCK_HELD:-0}"
+    local flock_bin=""
+
+    if (( maintenance_lock_depth > 0 )) || [[ "${previous_lock_state}" == "1" ]]; then
+        "$@"
+        return $?
+    fi
+
+    flock_bin=$(command -v flock 2>/dev/null || true)
+    if [[ -z "${flock_bin}" ]]; then
+        LOGE "未找到 flock，无法安全执行 x-ui 维护操作"
+        return 1
+    fi
+    if ! exec {lock_fd}>"${maintenance_lock_file}"; then
+        LOGE "无法打开 x-ui 维护锁 ${maintenance_lock_file}"
+        return 1
+    fi
+    if ! "${flock_bin}" -x "${lock_fd}"; then
+        LOGE "获取 x-ui 维护锁失败"
+        exec {lock_fd}>&-
+        return 1
+    fi
+
+    maintenance_lock_depth=1
+    export XUI_MAINTENANCE_LOCK_HELD=1
+    "$@" || status=$?
+    maintenance_lock_depth=0
+    if [[ "${previous_lock_state}" == "1" ]]; then
+        export XUI_MAINTENANCE_LOCK_HELD=1
+    else
+        unset XUI_MAINTENANCE_LOCK_HELD
+    fi
+    "${flock_bin}" -u "${lock_fd}" || true
+    exec {lock_fd}>&-
+    return "${status}"
+}
+
+watchdog_set_cooldown() {
+    local now=""
+    now=$(date +%s)
+    [[ "${now}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${now}" > "${watchdog_cooldown_file}"
 }
 
 # check root
@@ -371,9 +422,17 @@ before_show_menu() {
     show_menu
 }
 
+run_installer() {
+    local installer_url="${repo_raw_base}/install.sh"
+    if [[ $# -gt 0 ]]; then
+        bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${installer_url}") "$1"
+    else
+        bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${installer_url}")
+    fi
+}
+
 install() {
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh")
-    if [[ $? == 0 ]]; then
+    if with_maintenance_lock run_installer; then
         if [[ $# == 0 ]]; then
             start
         else
@@ -391,8 +450,7 @@ update() {
         fi
         return 0
     fi
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh")
-    if [[ $? == 0 ]]; then
+    if with_maintenance_lock run_installer; then
         LOGI "更新完成, 面板已自动重启"
         before_show_menu
     fi
@@ -409,15 +467,31 @@ update_menu() {
         return 0
     fi
 
-    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui.sh"
-    chmod +x /usr/bin/x-ui
-
-    if [[ $? == 0 ]]; then
+    if with_maintenance_lock update_menu_locked; then
         echo -e "${green}主菜单更新成功.${plain}"
         before_show_menu
     else
         echo -e "${red}主菜单更新失败.${plain}"
         return 1
+    fi
+}
+
+update_menu_locked() {
+    curl -fL --retry 3 --proto '=https' --tlsv1.2 -o /usr/bin/x-ui "${repo_raw_base}/ui.sh" || return 1
+    chmod +x /usr/bin/x-ui
+
+    local cron_file=""
+    if [[ "${distro}" == "alpine" ]]; then
+        cron_file="/etc/crontabs/root"
+    else
+        cron_file="/etc/cron.d/x-ui"
+    fi
+    if [[ -f "${cron_file}" ]]; then
+        sed -i \
+            -e '/x-ui watchdog-xray/ s|^\* \* \* \* \*|*/5 * * * *|' \
+            -e '/x-ui watchdog-xray/ s|$(/usr/bin/x-ui watchdog-xray|$(XUI_MAINTENANCE_LOCK_HELD=1 /usr/bin/x-ui watchdog-xray|' \
+            -e 's/Xray API health check every minute/Xray API health check every 5 minutes/' \
+            "${cron_file}"
     fi
 }
 
@@ -434,7 +508,7 @@ legacy_version() {
     [[ "${tag_version}" == v* ]] || tag_version="v${tag_version}"
 
     echo "下载安装 x-ui 版本: ${tag_version}..."
-    bash <(curl -fsSL --retry 3 --proto '=https' --tlsv1.2 "${repo_raw_base}/install.sh") "${tag_version}"
+    with_maintenance_lock run_installer "${tag_version}"
 }
 
 # Function to handle the deletion of the script file
@@ -451,6 +525,10 @@ uninstall() {
         fi
         return 0
     fi
+    with_maintenance_lock uninstall_locked
+}
+
+uninstall_locked() {
       service_disable >/dev/null 2>&1 || true
       service_stop >/dev/null 2>&1 || true
       rm -rf /usr/local/x-ui /etc/x-ui
@@ -468,9 +546,11 @@ uninstall() {
           sed -i '/x-ui watchdog-xray/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Auto restart xray daily at 3:30 AM/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Xray API health check every minute/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Xray API health check every 5 minutes/d' /etc/crontabs/root 2>/dev/null || true
       else
           rm -f /etc/cron.d/x-ui
       fi
+      rm -f "${watchdog_paused_file}"
 	  if [[ -e /app/bin/ ]]; then
 	    pgrep -f x-ui | xargs -r kill -9
         rm /app -rf
@@ -486,6 +566,8 @@ uninstall() {
 }
 
 reset_user() {
+    local restart_after=0
+
     confirm "您确定要重置面板用户名和密码吗?" "n"
     if [[ $? != 0 ]]; then
         if [[ $# == 0 ]]; then
@@ -497,13 +579,27 @@ reset_user() {
     [[ -z $config_account ]] && config_account=$(date +%s%N | md5sum | cut -c 1-8)
     read -rp "请设置登录密码 [默认密码系统随机生成]: " config_password
     [[ -z $config_password ]] && config_password=$(date +%s%N | md5sum | cut -c 1-8)
-    /usr/local/x-ui/x-ui setting -username ${config_account} -password ${config_password} >/dev/null 2>&1
-    /usr/local/x-ui/x-ui setting -remove_secret >/dev/null 2>&1
-    echo -e "面板登录用户名已重置为: ${green} ${config_account} ${plain}"
-    echo -e "面板登录密码已重置为: ${green} ${config_password} ${plain}"
+    confirm "立即重启面板以应用新凭据吗?" "y" && restart_after=1
+    with_maintenance_lock reset_user_locked "${config_account}" "${config_password}" "${restart_after}" || return 1
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
+}
+
+reset_user_locked() {
+    local account="$1"
+    local password="$2"
+    local restart_after="$3"
+
+    /usr/local/x-ui/x-ui setting -username "${account}" -password "${password}" >/dev/null 2>&1 || return 1
+    /usr/local/x-ui/x-ui setting -remove_secret >/dev/null 2>&1 || return 1
+    echo -e "面板登录用户名已重置为: ${green} ${account} ${plain}"
+    echo -e "面板登录密码已重置为: ${green} ${password} ${plain}"
     echo -e "${yellow} 面板登录秘密令牌已禁用 ${plain}"
     echo -e "${green} 请使用新的登录用户名和密码访问 X-UI 面板请记住它们! ${plain}"
-    confirm_restart
+    if [[ "${restart_after}" == "1" ]]; then
+        restart_locked
+    fi
 }
 
 gen_random_string() {
@@ -522,13 +618,18 @@ reset_webbasepath() {
     fi
 
     config_webBasePath=$(gen_random_string 10)
+    with_maintenance_lock reset_webbasepath_locked "${config_webBasePath}" || return 1
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
+}
 
-    # Apply the new web base path setting
-    /usr/local/x-ui/x-ui setting -webBasePath "${config_webBasePath}" >/dev/null 2>&1
-    
-    echo -e "面板路径已重置为: ${green}${config_webBasePath}${plain}"
+reset_webbasepath_locked() {
+    local web_base_path="$1"
+    /usr/local/x-ui/x-ui setting -webBasePath "${web_base_path}" >/dev/null 2>&1 || return 1
+    echo -e "面板路径已重置为: ${green}${web_base_path}${plain}"
     echo -e "${green}请访问新面板径.${plain}"
-    restart
+    restart_locked
 }
 
 reset_config() {
@@ -539,9 +640,16 @@ reset_config() {
         fi
         return 0
     fi
-    /usr/local/x-ui/x-ui setting -reset
+    with_maintenance_lock reset_config_locked || return 1
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
+}
+
+reset_config_locked() {
+    /usr/local/x-ui/x-ui setting -reset || return 1
     echo -e "所有面板设置已重置为默认值."
-    restart
+    restart_locked
 }
 
 check_config() {
@@ -573,6 +681,8 @@ check_config() {
 }
 
 set_port() {
+    local restart_after=0
+
     echo && echo -n -e "输入端口号[1-65535]: " && read -r port
     if [[ -z "${port}" ]]; then
         LOGD "已取消"
@@ -581,36 +691,62 @@ set_port() {
         LOGE "端口必须是 1-65535 之间的数字"
         before_show_menu
     else
-        /usr/local/x-ui/x-ui setting -port "${port}"
-        echo -e "端口已设置, 请立即重启面板, 并使用新的端口 ${green}${port}${plain} 访问面板"
-        confirm_restart
+        confirm "立即重启面板以应用新端口吗?" "y" && restart_after=1
+        with_maintenance_lock set_port_locked "${port}" "${restart_after}" || return 1
+        if [[ $# == 0 ]]; then
+            before_show_menu
+        fi
     fi
 }
 
-start() {
+set_port_locked() {
+    local port="$1"
+    local restart_after="$2"
+    /usr/local/x-ui/x-ui setting -port "${port}" || return 1
+    if [[ "${restart_after}" == "1" ]]; then
+        restart_locked
+    else
+        echo -e "端口已设置, 请手动重启面板, 并使用新的端口 ${green}${port}${plain} 访问面板"
+    fi
+}
+
+start_locked() {
+    rm -f "${watchdog_paused_file}"
+    rm -f "${watchdog_cooldown_file}"
     check_status
     if [[ $? == 0 ]]; then
         echo ""
         LOGI "面板正在运行, 无需再次启动, 如需重启请选择重启"
     else
-        service_start
+        service_start || return 1
         sleep 2
         check_status
         if [[ $? == 0 ]]; then
+            watchdog_set_cooldown || true
             LOGI "x-ui启动成功"
         else
             LOGE "面板启动失败, 可能是因为启动时间超过两秒, 请稍后查看日志信息"
+            return 1
         fi
-    fi
-
-    if [[ $# == 0 ]]; then
-        before_show_menu
     fi
 }
 
-stop() {
+start() {
+    local result=0
+    with_maintenance_lock start_locked || result=$?
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
+    return "${result}"
+}
+
+stop_locked() {
     local result=0
 
+    if ! : > "${watchdog_paused_file}"; then
+        LOGE "无法记录手动停止状态，已取消停止操作"
+        return 1
+    fi
     check_status
     if [[ $? == 1 ]]; then
         echo ""
@@ -623,22 +759,36 @@ stop() {
             result=1
         fi
     fi
+    return "${result}"
+}
 
+stop() {
+    local result=0
+    with_maintenance_lock stop_locked || result=$?
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
     return "${result}"
 }
 
-restart() {
+restart_locked() {
     local result=0
 
+    rm -f "${watchdog_paused_file}"
+    rm -f "${watchdog_cooldown_file}"
     if service_restart && service_wait_started; then
+        watchdog_set_cooldown || true
         LOGI "x-ui和xray重启成功"
     else
         LOGE "面板重启失败，停止或启动阶段未成功"
         result=1
     fi
+    return "${result}"
+}
+
+restart() {
+    local result=0
+    with_maintenance_lock restart_locked || result=$?
     if [[ $# == 0 ]]; then
         before_show_menu
     fi
@@ -690,14 +840,19 @@ show_banlog() {
 }
 
 restart_xray() {
-    service_reload
-    if [[ $? -eq 0 ]]; then
+    with_maintenance_lock restart_xray_locked || true
+    if [[ $# == 0 ]]; then
+        before_show_menu
+    fi
+}
+
+restart_xray_locked() {
+    if service_reload; then
+        watchdog_set_cooldown || true
         LOGI "已向 x-ui 发送 Xray 重启信号，请检查服务状态确认重启结果"
     else
         LOGE "发送 Xray 重启信号失败"
-    fi
-    if [[ $# == 0 ]]; then
-        before_show_menu
+        return 1
     fi
 }
 
@@ -996,14 +1151,17 @@ check_xray_health() {
 
 watchdog_xray() {
     local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
-    local cooldown_file="/run/x-ui-xray-watchdog.cooldown"
     local api_status=0
     local attempt=0
     local now=""
     local last_attempt=""
 
+    if [[ -e "${watchdog_paused_file}" ]]; then
+        return 0
+    fi
+
     if xray_api_check "${api_address}"; then
-        rm -f "${cooldown_file}"
+        rm -f "${watchdog_cooldown_file}"
         return 0
     else
         api_status=$?
@@ -1014,10 +1172,10 @@ watchdog_xray() {
     fi
 
     now=$(date +%s)
-    last_attempt=$(cat "${cooldown_file}" 2>/dev/null || true)
+    last_attempt=$(cat "${watchdog_cooldown_file}" 2>/dev/null || true)
     if [[ "${now}" =~ ^[0-9]+$ && "${last_attempt}" =~ ^[0-9]+$ ]] && \
-        (( now >= last_attempt && now - last_attempt < 300 )); then
-        LOGD "Xray API 仍无响应，最近一次恢复失败不足 5 分钟，暂不重复重启"
+        (( now >= last_attempt && now - last_attempt < 60 )); then
+        LOGD "Xray API 仍无响应，最近一次恢复失败不足 1 分钟，暂不重复重启"
         return 1
     fi
 
@@ -1025,7 +1183,7 @@ watchdog_xray() {
     if service_reload; then
         sleep 5
         if xray_api_check "${api_address}"; then
-            rm -f "${cooldown_file}"
+            rm -f "${watchdog_cooldown_file}"
             LOGI "Xray 重载后 API 已恢复"
             return 0
         fi
@@ -1041,7 +1199,7 @@ watchdog_xray() {
     else
         for ((attempt = 1; attempt <= 5; attempt++)); do
             if xray_api_check "${api_address}"; then
-                rm -f "${cooldown_file}"
+                rm -f "${watchdog_cooldown_file}"
                 LOGI "x-ui 服务重启后 Xray API 已恢复"
                 return 0
             fi
@@ -1050,7 +1208,7 @@ watchdog_xray() {
         LOGE "x-ui 服务重启后 Xray API 仍无响应，请检查服务日志"
     fi
 
-    [[ "${now}" =~ ^[0-9]+$ ]] && printf '%s\n' "${now}" > "${cooldown_file}"
+    [[ "${now}" =~ ^[0-9]+$ ]] && printf '%s\n' "${now}" > "${watchdog_cooldown_file}"
     return 1
 }
 
@@ -1098,39 +1256,41 @@ update_geo() {
         mv -f "${temp}" "${target}"
     }
 
+    update_geo_files_locked() {
+        local label="$1"
+        local first_target="$2"
+        local first_url="$3"
+        local second_target="$4"
+        local second_url="$5"
+
+        service_stop
+        if download_geo_asset "${first_target}" "${first_url}" && \
+            download_geo_asset "${second_target}" "${second_url}"; then
+            echo -e "${green}${label} 数据升级成功!${plain}"
+        else
+            LOGE "${label} 数据下载失败，未主动删除原有文件"
+        fi
+        service_start
+    }
+
     case "$choice" in
     0)
         show_menu
         ;;
     1)
-        service_stop
-        if download_geo_asset geoip.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat && \
-            download_geo_asset geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat; then
-            echo -e "${green}Loyalsoldier 数据升级成功!${plain}"
-        else
-            LOGE "Loyalsoldier 数据下载失败，未主动删除原有文件"
-        fi
-        service_start
+        with_maintenance_lock update_geo_files_locked "Loyalsoldier" geoip.dat \
+            https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat \
+            geosite.dat https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
         ;;
     2)
-        service_stop
-        if download_geo_asset geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat && \
-            download_geo_asset geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat; then
-            echo -e "${green}chocolate4u 数据升级成功!${plain}"
-        else
-            LOGE "chocolate4u 数据下载失败，未主动删除原有文件"
-        fi
-        service_start
+        with_maintenance_lock update_geo_files_locked "chocolate4u" geoip_IR.dat \
+            https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat \
+            geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
         ;;
     3)
-        service_stop
-        if download_geo_asset geoip_VN.dat https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geoip.dat && \
-            download_geo_asset geosite_VN.dat https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geosite.dat; then
-            echo -e "${green}vuong2023 数据升级成功!${plain}"
-        else
-            LOGE "vuong2023 数据下载失败，未主动删除原有文件"
-        fi
-        service_start
+        with_maintenance_lock update_geo_files_locked "vuong2023" geoip_VN.dat \
+            https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geoip.dat \
+            geosite_VN.dat https://github.com/vuong2023/vn-v2ray-rules/releases/latest/download/geosite.dat
         ;;
     *)
         echo -e "${red}选项无效请选择一个有效的数字${plain}\n"
@@ -1754,7 +1914,7 @@ if [[ $# > 0 ]]; then
         check_install 0 && check_xray_health "${2:-}"
         ;;
     "watchdog-xray")
-        check_install 0 && watchdog_xray "${2:-}"
+        check_install 0 && with_maintenance_lock watchdog_xray "${2:-}"
         ;;
     *) show_usage ;;
     esac
