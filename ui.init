@@ -14,6 +14,7 @@ DAEMON_NAME=x-ui
 PIDFILE=/run/${DAEMON_NAME}.pid
 WORKDIR=/usr/local/x-ui
 export XRAY_VMESS_AEAD_FORCED="${XRAY_VMESS_AEAD_FORCED:-false}"
+export GOMEMLIMIT="${GOMEMLIMIT:-48MiB}"
 
 if [ ! -x "${DAEMON}" ]; then
     echo "${DAEMON} 不存在或不可执行" >&2
