@@ -16,7 +16,11 @@ maintenance_request_dir="/run/x-ui-maintenance-requests"
 maintenance_lock_release_timeout=1
 watchdog_paused_file="/run/x-ui-xray-watchdog.paused"
 watchdog_cooldown_file="/run/x-ui-xray-watchdog.cooldown"
+watchdog_loop_lock_file="/run/x-ui-xray-watchdog-loop.lock"
+watchdog_loop_pid_file="/run/x-ui-xray-watchdog-loop.pid"
 maintenance_lock_depth=0
+XUI_XRAY_API_ERROR=""
+XUI_XRAY_API_STATUS=0
 
 #Add some basic function here
 function LOGD() {
@@ -778,12 +782,28 @@ update_menu_locked() {
     fi
     if [[ -f "${cron_file}" ]]; then
         sed -i \
-            -e '/x-ui watchdog-xray/ s|^\* \* \* \* \*|*/5 * * * *|' \
-            -e '/x-ui watchdog-xray/ s|[^ ]*/flock -n /run/x-ui-xray-watchdog.lock ||' \
-            -e '/x-ui watchdog-xray/ s|XUI_MAINTENANCE_LOCK_HELD=1 ||' \
-            -e 's/Xray API health check every minute/Xray API health check every 5 minutes/' \
+            -e '/x-ui watchdog-xray/d' \
+            -e '/x-ui watchdog-loop/d' \
+            -e '/Xray API health check every minute/d' \
+            -e '/Xray API health check every 5 minutes/d' \
+            -e '/Xray API health check every 50 seconds/d' \
+            -e '/Xray API 每 50 秒健康检测/d' \
             "${cron_file}"
+        if [[ "${distro}" == "alpine" ]]; then
+            {
+                echo "# Xray API 每 50 秒健康检测"
+                echo "* * * * * /usr/bin/x-ui watchdog-loop >/dev/null 2>&1"
+            } >> "${cron_file}"
+        else
+            {
+                echo "# Xray API 每 50 秒健康检测"
+                echo "* * * * * root /usr/bin/x-ui watchdog-loop >/dev/null 2>&1"
+            } >> "${cron_file}"
+        fi
+        chmod 644 "${cron_file}"
     fi
+    nohup /bin/sh -c 'unset XUI_MAINTENANCE_LOCK_HELD; exec /usr/bin/x-ui watchdog-loop' \
+        >/dev/null 2>&1 </dev/null &
 }
 
 legacy_version() {
@@ -820,6 +840,7 @@ uninstall() {
 }
 
 uninstall_locked() {
+      watchdog_loop_stop
       service_disable >/dev/null 2>&1 || true
       service_stop >/dev/null 2>&1 || true
       rm -rf /usr/local/x-ui /etc/x-ui
@@ -835,9 +856,12 @@ uninstall_locked() {
       if [[ "${distro}" == "alpine" ]]; then
           sed -i '/x-ui restart-xray/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/x-ui watchdog-xray/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/x-ui watchdog-loop/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Auto restart xray daily at 3:30 AM/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Xray API health check every minute/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Xray API health check every 5 minutes/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Xray API health check every 50 seconds/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Xray API 每 50 秒健康检测/d' /etc/crontabs/root 2>/dev/null || true
       else
           rm -f /etc/cron.d/x-ui
       fi
@@ -1393,10 +1417,32 @@ xray_binary_path() {
 xray_api_check() {
     local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
     local xray_binary=""
+    local api_output=""
+    local api_status=0
 
-    xray_binary=$(xray_binary_path) || return 2
-    command -v timeout >/dev/null 2>&1 || return 2
-    timeout 5 "${xray_binary}" api statsquery --server="${api_address}" >/dev/null 2>&1
+    XUI_XRAY_API_ERROR=""
+    XUI_XRAY_API_STATUS=0
+    xray_binary=$(xray_binary_path) || {
+        XUI_XRAY_API_ERROR="未找到 Xray 可执行文件"
+        XUI_XRAY_API_STATUS=2
+        return 2
+    }
+    command -v timeout >/dev/null 2>&1 || {
+        XUI_XRAY_API_ERROR="未找到 timeout 命令"
+        XUI_XRAY_API_STATUS=2
+        return 2
+    }
+    api_output=$(timeout 5 "${xray_binary}" api statsquery --server="${api_address}" 2>&1 >/dev/null)
+    api_status=$?
+    XUI_XRAY_API_STATUS=${api_status}
+    api_output="${api_output//$'\r'/}"
+    api_output="${api_output//$'\n'/; }"
+    XUI_XRAY_API_ERROR="${api_output:0:512}"
+    if [[ ${api_status} -eq 124 && -z "${XUI_XRAY_API_ERROR}" ]]; then
+        XUI_XRAY_API_ERROR="API 调用超过 5 秒未返回"
+    fi
+    [[ ${api_status} -eq 0 ]] && return 0
+    return 1
 }
 
 check_xray_health() {
@@ -1460,6 +1506,7 @@ check_xray_health() {
         else
             LOGD "Xray 本机 API ${api_address} 未确认响应；API 可能未启用或地址不同"
         fi
+        LOGD "Xray API statsquery 退出码 ${XUI_XRAY_API_STATUS}：${XUI_XRAY_API_ERROR:-命令未提供错误文本}"
         [[ ${result} -eq 0 ]] && result=2
     fi
 
@@ -1495,6 +1542,9 @@ watchdog_xray() {
     if [[ -e "${watchdog_paused_file}" ]]; then
         return 0
     fi
+    if ! check_status >/dev/null 2>&1 && ! check_enabled >/dev/null 2>&1; then
+        return 0
+    fi
 
     if xray_api_check "${api_address}"; then
         rm -f "${watchdog_cooldown_file}"
@@ -1509,6 +1559,7 @@ watchdog_xray() {
         LOGE "Xray API 检测依赖不可用，无法自动判断健康状态"
         return 2
     fi
+    LOGD "Xray API statsquery 退出码 ${XUI_XRAY_API_STATUS}：${XUI_XRAY_API_ERROR:-命令未提供错误文本}"
 
     now=$(date +%s)
     last_attempt=$(cat "${watchdog_cooldown_file}" 2>/dev/null || true)
@@ -1601,6 +1652,92 @@ watchdog_xray() {
 
     [[ "${now}" =~ ^[0-9]+$ ]] && printf '%s\n' "${now}" > "${watchdog_cooldown_file}"
     return 1
+}
+
+watchdog_loop_cleanup() {
+    local recorded_pid=""
+    local recorded_start=""
+
+    if [[ -n "${watchdog_loop_sleep_pid:-}" ]]; then
+        kill "${watchdog_loop_sleep_pid}" 2>/dev/null || true
+    fi
+    if IFS=' ' read -r recorded_pid recorded_start < "${watchdog_loop_pid_file}" 2>/dev/null && \
+        [[ "${recorded_pid}" == "${BASHPID}" ]]; then
+        rm -f "${watchdog_loop_pid_file}"
+    fi
+    exit 0
+}
+
+watchdog_loop_stop() {
+    local recorded_pid=""
+    local recorded_start=""
+    local actual_start=""
+
+    if ! IFS=' ' read -r recorded_pid recorded_start < "${watchdog_loop_pid_file}" 2>/dev/null || \
+        [[ ! "${recorded_pid}" =~ ^[1-9][0-9]*$ || ! "${recorded_start}" =~ ^[0-9]+$ ]]; then
+        rm -f "${watchdog_loop_pid_file}"
+        return 0
+    fi
+    actual_start=$(process_start_time "${recorded_pid}" || true)
+    if [[ "${actual_start}" == "${recorded_start}" ]]; then
+        kill -TERM "${recorded_pid}" 2>/dev/null || true
+    fi
+    rm -f "${watchdog_loop_pid_file}"
+}
+
+watchdog_loop() {
+    local api_address="${1:-${XUI_XRAY_API_ADDRESS:-127.0.0.1:62789}}"
+    local log_file="/var/log/x-ui-xray-watchdog.log"
+    local log_tmp=""
+    local output=""
+    local status=0
+    local interval=50
+    local loop_lock_fd=""
+    local flock_bin=""
+    local loop_start=""
+    local watchdog_loop_sleep_pid=""
+
+    flock_bin=$(command -v flock 2>/dev/null || true)
+    if [[ -z "${flock_bin}" ]]; then
+        LOGE "未找到 flock，无法保证 Xray 巡检循环不会重复运行"
+        return 1
+    fi
+    if ! exec {loop_lock_fd}>"${watchdog_loop_lock_file}"; then
+        LOGE "无法打开 Xray 巡检循环锁 ${watchdog_loop_lock_file}"
+        return 1
+    fi
+    if ! "${flock_bin}" -n "${loop_lock_fd}"; then
+        return 0
+    fi
+
+    loop_start=$(process_start_time "${BASHPID}" || true)
+    [[ "${loop_start}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s %s\n' "${BASHPID}" "${loop_start}" > "${watchdog_loop_pid_file}" || return 1
+    trap watchdog_loop_cleanup TERM INT HUP
+
+    while [[ -x /usr/local/x-ui/x-ui ]]; do
+        if [[ ! -e "${watchdog_paused_file}" ]]; then
+            output=$(with_maintenance_lock watchdog_xray "${api_address}" 2>&1)
+            status=$?
+            if [[ -n "${output}" ]]; then
+                log_tmp="${log_file}.tmp.${BASHPID}"
+                {
+                    if [[ -f "${log_file}" ]]; then
+                        tail -n 49 "${log_file}"
+                    fi
+                    printf '%s\n' "${output}"
+                } | tail -n 50 > "${log_tmp}" && mv -f "${log_tmp}" "${log_file}"
+                rm -f "${log_tmp}"
+            fi
+        fi
+        sleep "${interval}" &
+        watchdog_loop_sleep_pid=$!
+        wait "${watchdog_loop_sleep_pid}" || true
+        watchdog_loop_sleep_pid=""
+    done
+
+    rm -f "${watchdog_loop_pid_file}"
+    return "${status}"
 }
 
 firewall_menu() {
@@ -2112,6 +2249,7 @@ show_usage() {
     echo -e "x-ui restart-xray - 重启xray服务"
     echo -e "x-ui check-xray [api-address] - 手动检测xray状态"
     echo -e "x-ui watchdog-xray [api-address] - 检测并自动恢复xray"
+    echo -e "x-ui watchdog-loop [api-address] - 每50秒检测并自动恢复xray"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 设置开机启动"
@@ -2306,6 +2444,9 @@ if [[ $# > 0 ]]; then
         ;;
     "watchdog-xray")
         check_install 0 && with_maintenance_lock watchdog_xray "${2:-}"
+        ;;
+    "watchdog-loop")
+        check_install 0 && watchdog_loop "${2:-}"
         ;;
     *) show_usage ;;
     esac
