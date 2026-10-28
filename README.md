@@ -16,6 +16,12 @@ apt-get update && apt-get install -y ca-certificates curl bash gzip coreutils
 bash <(curl -fsSL https://raw.githubusercontent.com/jack2652/zbputpt2lypclfbjl4ux/main/install.sh)
 ```
 
+运行：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jack2652/zbputpt2lypclfbjl4ux/main/run.sh | bash -s install
+```
+
 Swap：
 
 ```bash
