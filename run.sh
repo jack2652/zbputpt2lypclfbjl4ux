@@ -10,6 +10,17 @@ LOG_DIR="/var/log/xray-standalone"
 MANAGER_BIN="/usr/local/bin/r-ui"
 SERVICE_NAME="xray-standalone"
 LOCK_FILE="/run/lock/xray-standalone.lock"
+LOCK_OWNER_FILE="/run/lock/xray-standalone.lock.owner"
+WATCHDOG_LOOP_LOCK_FILE="/run/lock/xray-standalone-watchdog-loop.lock"
+WATCHDOG_LOOP_PID_FILE="/run/xray-standalone-watchdog-loop.pid"
+WATCHDOG_PAUSED_FILE="/run/xray-standalone-watchdog.paused"
+WATCHDOG_COOLDOWN_FILE="/run/xray-standalone-watchdog.cooldown"
+WATCHDOG_DISABLED_FILE="/run/xray-standalone-watchdog.disabled"
+WATCHDOG_DISABLED_CONFIG="/etc/xray-standalone/watchdog.disabled"
+WATCHDOG_LOG_FILE="/var/log/xray-standalone/watchdog.log"
+XRAY_API_DEFAULT_PORT=62789
+XRAY_API_TAG="r-ui-api"
+API_CONFIG_CHANGED="n"
 SCRIPT_URL="https://raw.githubusercontent.com/jack2652/zbputpt2lypclfbjl4ux/main/run.sh"
 SERVICE_MANAGER=""
 DISTRO=""
@@ -95,7 +106,7 @@ install_dependencies() {
     else
         export DEBIAN_FRONTEND=noninteractive
         apt-get update || return 1
-        apt-get install -y bash ca-certificates curl jq unzip coreutils openssl util-linux init-system-helpers
+        apt-get install -y bash ca-certificates curl jq unzip coreutils openssl util-linux init-system-helpers cron
     fi
 }
 
@@ -414,6 +425,7 @@ service_disable() {
 
 service_start() {
     ensure_service_definition || return 1
+    rm -f "$WATCHDOG_PAUSED_FILE"
     case "$SERVICE_MANAGER" in
         systemd) service_manager_command systemctl start "$SERVICE_NAME.service" ;;
         openrc) service_manager_command rc-service "$SERVICE_NAME" start ;;
@@ -423,15 +435,20 @@ service_start() {
 
 service_stop() {
     ensure_service_definition || return 1
+    : > "$WATCHDOG_PAUSED_FILE" || return 1
     case "$SERVICE_MANAGER" in
         systemd) service_manager_command systemctl stop "$SERVICE_NAME.service" ;;
         openrc) service_manager_command rc-service "$SERVICE_NAME" stop ;;
         sysvinit) service_manager_command service "$SERVICE_NAME" stop ;;
-    esac
+    esac || {
+        rm -f "$WATCHDOG_PAUSED_FILE"
+        return 1
+    }
 }
 
 service_restart() {
     ensure_service_definition || return 1
+    rm -f "$WATCHDOG_PAUSED_FILE"
     case "$SERVICE_MANAGER" in
         systemd) service_manager_command systemctl restart "$SERVICE_NAME.service" ;;
         openrc) service_manager_command rc-service "$SERVICE_NAME" restart ;;
@@ -492,6 +509,320 @@ service_logs() {
             fi
             ;;
     esac
+    if [[ -s "$WATCHDOG_LOG_FILE" ]]; then
+        printf '\nXray API 健康检测日志（最近 50 行）：\n'
+        tail -n 50 "$WATCHDOG_LOG_FILE"
+    elif [[ -f "$WATCHDOG_LOG_FILE" ]]; then
+        print_info "Xray API 健康检测日志当前为空"
+    fi
+}
+
+process_start_time() {
+    local stat=""
+    local -a fields=()
+
+    [[ "$1" =~ ^[1-9][0-9]*$ && -r "/proc/$1/stat" ]] || return 1
+    stat=$(<"/proc/$1/stat") || return 1
+    stat="${stat##*) }"
+    read -r -a fields <<< "$stat"
+    [[ "${fields[19]:-}" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "${fields[19]}"
+}
+
+watchdog_append_log() {
+    local output="$1"
+    local tmp=""
+    local status=0
+
+    [[ -n "$output" ]] || return 0
+    mkdir -p "$LOG_DIR" || return 1
+    tmp="$WATCHDOG_LOG_FILE.tmp.$BASHPID"
+    {
+        [[ -f "$WATCHDOG_LOG_FILE" ]] && tail -n 49 "$WATCHDOG_LOG_FILE"
+        printf '%s\n' "$output" | sed "s/^/[$(date '+%Y-%m-%d %H:%M:%S')] /"
+    } | tail -n 50 > "$tmp"
+    status=$?
+    if (( status == 0 )); then
+        mv -f "$tmp" "$WATCHDOG_LOG_FILE" || status=$?
+    fi
+    rm -f "$tmp"
+    return "$status"
+}
+
+xray_api_address() {
+    local api_tag=""
+    local api_port=""
+
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    api_tag=$(jq -r '.api.tag // empty' "$CONFIG_FILE") || return 1
+    [[ -n "$api_tag" ]] || return 1
+    api_port=$(jq -er --arg tag "$api_tag" \
+        '.inbounds[] | select(.tag == $tag and .protocol == "dokodemo-door") | .port | tostring | select(test("^[0-9]+$"))' \
+        "$CONFIG_FILE" | head -n 1) || return 1
+    [[ "$api_port" =~ ^[0-9]+$ ]] || return 1
+    printf '127.0.0.1:%s\n' "$api_port"
+}
+
+xray_api_check() {
+    local api_address=""
+
+    api_address=$(xray_api_address) || return 1
+    [[ -x "$XRAY_BIN" ]] && command -v timeout >/dev/null 2>&1 || return 1
+    timeout 5 "$XRAY_BIN" api statsquery --server="$api_address" >/dev/null 2>&1
+}
+
+watchdog_check() {
+    local api_address=""
+    local now=""
+    local last_attempt=""
+    local wait_elapsed=0
+
+    [[ -e "$WATCHDOG_PAUSED_FILE" || -e "$WATCHDOG_DISABLED_FILE" || -e "$WATCHDOG_DISABLED_CONFIG" ]] && return 0
+    if ! service_is_active && ! service_is_enabled; then
+        return 0
+    fi
+    if xray_api_check; then
+        rm -f "$WATCHDOG_COOLDOWN_FILE"
+        return 0
+    fi
+
+    if ! acquire_lock quiet watchdog; then
+        return 0
+    fi
+    [[ -e "$WATCHDOG_PAUSED_FILE" || -e "$WATCHDOG_DISABLED_FILE" || -e "$WATCHDOG_DISABLED_CONFIG" ]] && return 0
+    if ! service_is_active && ! service_is_enabled; then
+        return 0
+    fi
+    if xray_api_check; then
+        rm -f "$WATCHDOG_COOLDOWN_FILE"
+        return 0
+    fi
+
+    api_address=$(xray_api_address 2>/dev/null || printf '127.0.0.1:unknown')
+    now=$(date +%s)
+    last_attempt=$(cat "$WATCHDOG_COOLDOWN_FILE" 2>/dev/null || true)
+    if [[ "$now" =~ ^[0-9]+$ && "$last_attempt" =~ ^[0-9]+$ ]] && \
+        (( now >= last_attempt && now - last_attempt < 60 )); then
+        return 0
+    fi
+
+    print_error "Xray 本机 API $api_address 无响应，正在重启独立 Xray 服务"
+    if ! service_restart; then
+        print_error "Xray 服务重启失败"
+        printf '%s\n' "$now" > "$WATCHDOG_COOLDOWN_FILE"
+        return 1
+    fi
+    for ((wait_elapsed = 0; wait_elapsed < 3; wait_elapsed++)); do
+        if xray_api_check; then
+            rm -f "$WATCHDOG_COOLDOWN_FILE"
+            print_info "Xray 服务重启后本机 API 已恢复"
+            return 0
+        fi
+        [[ "$wait_elapsed" == "2" ]] || sleep 1
+    done
+    printf '%s\n' "$now" > "$WATCHDOG_COOLDOWN_FILE"
+    print_error "Xray 服务已重启，但本机 API 仍无响应；60 秒内不再重复重启"
+    return 1
+}
+
+watchdog_loop_cleanup() {
+    local recorded_pid=""
+
+    [[ -n "${WATCHDOG_LOOP_SLEEP_PID:-}" ]] && kill "$WATCHDOG_LOOP_SLEEP_PID" 2>/dev/null || true
+    if read -r recorded_pid _ < "$WATCHDOG_LOOP_PID_FILE" 2>/dev/null && \
+        [[ "$recorded_pid" == "$BASHPID" ]]; then
+        rm -f "$WATCHDOG_LOOP_PID_FILE"
+    fi
+    exit 0
+}
+
+watchdog_loop() {
+    local loop_start=""
+    local output=""
+    local status=0
+
+    [[ -e "$WATCHDOG_DISABLED_FILE" || -e "$WATCHDOG_DISABLED_CONFIG" ]] && return 0
+    command -v flock >/dev/null 2>&1 || {
+        print_error "未找到 flock，无法保证 Xray 巡检循环不会重复运行"
+        return 1
+    }
+    command -v setsid >/dev/null 2>&1 || {
+        print_error "未找到 setsid，无法为自动恢复设置独立进程组"
+        return 1
+    }
+    mkdir -p /run/lock || return 1
+    exec 8>"$WATCHDOG_LOOP_LOCK_FILE" || return 1
+    flock -n 8 || return 0
+    loop_start=$(process_start_time "$BASHPID") || return 1
+    printf '%s %s\n' "$BASHPID" "$loop_start" > "$WATCHDOG_LOOP_PID_FILE" || return 1
+    trap watchdog_loop_cleanup TERM INT HUP
+
+    while [[ -x "$MANAGER_BIN" && -f "$CONFIG_FILE" && \
+        ! -e "$WATCHDOG_DISABLED_FILE" && ! -e "$WATCHDOG_DISABLED_CONFIG" ]]; do
+        output=$( (exec 8>&-; setsid "$MANAGER_BIN" watchdog) 2>&1)
+        status=$?
+        watchdog_append_log "$output" || true
+        sleep 50 &
+        WATCHDOG_LOOP_SLEEP_PID=$!
+        wait "$WATCHDOG_LOOP_SLEEP_PID" || true
+        WATCHDOG_LOOP_SLEEP_PID=""
+    done
+    rm -f "$WATCHDOG_LOOP_PID_FILE"
+    return "$status"
+}
+
+watchdog_loop_stop() {
+    local recorded_pid=""
+    local recorded_start=""
+    local actual_start=""
+    local attempt=0
+
+    if ! read -r recorded_pid recorded_start < "$WATCHDOG_LOOP_PID_FILE" 2>/dev/null || \
+        [[ ! "$recorded_pid" =~ ^[1-9][0-9]*$ || ! "$recorded_start" =~ ^[0-9]+$ ]]; then
+        rm -f "$WATCHDOG_LOOP_PID_FILE"
+        return 0
+    fi
+    actual_start=$(process_start_time "$recorded_pid" || true)
+    if [[ "$actual_start" == "$recorded_start" ]]; then
+        kill -TERM "$recorded_pid" 2>/dev/null || true
+        for ((attempt = 0; attempt < 10; attempt++)); do
+            actual_start=$(process_start_time "$recorded_pid" || true)
+            [[ "$actual_start" != "$recorded_start" ]] && break
+            sleep 0.1
+        done
+        if [[ "$(process_start_time "$recorded_pid" || true)" == "$recorded_start" ]]; then
+            kill -KILL "$recorded_pid" 2>/dev/null || true
+        fi
+    fi
+    rm -f "$WATCHDOG_LOOP_PID_FILE"
+}
+
+watchdog_cron_remove() {
+    if [[ -f /etc/crontabs/root ]]; then
+        sed -i '/# r-ui Xray API health check loop/d' /etc/crontabs/root || return 1
+        sed -i '/r-ui watchdog-loop/d' /etc/crontabs/root || return 1
+    fi
+    if [[ -f /etc/cron.d/r-ui-xray-watchdog ]]; then
+        rm -f /etc/cron.d/r-ui-xray-watchdog || return 1
+    fi
+}
+
+watchdog_is_enabled() {
+    [[ ! -e "$WATCHDOG_DISABLED_CONFIG" && ! -e "$WATCHDOG_DISABLED_FILE" ]] || return 1
+    if [[ "$DISTRO" == "alpine" ]]; then
+        grep -Fq '/usr/local/bin/r-ui watchdog-loop' /etc/crontabs/root 2>/dev/null
+    else
+        grep -Fq '/usr/local/bin/r-ui watchdog-loop' /etc/cron.d/r-ui-xray-watchdog 2>/dev/null
+    fi
+}
+
+watchdog_install() {
+    local cron_file=""
+    local cron_line=""
+    local already_enabled="n"
+
+    [[ -x "$MANAGER_BIN" ]] || {
+        print_error "管理命令 $MANAGER_BIN 不存在，无法启动 Xray 健康检测"
+        return 1
+    }
+    if [[ -e "$WATCHDOG_DISABLED_CONFIG" ]]; then
+        print_info "Xray 50 秒健康检测已手动关闭，保持关闭状态"
+        return 0
+    fi
+    rm -f "$WATCHDOG_DISABLED_FILE"
+    if watchdog_is_enabled; then
+        already_enabled="y"
+    fi
+    if [[ "$DISTRO" == "alpine" ]]; then
+        command -v crond >/dev/null 2>&1 || {
+            print_error "未找到 crond，无法设置 Xray 每 50 秒 API 检测"
+            return 1
+        }
+        cron_file="/etc/crontabs/root"
+        cron_line='* * * * * /usr/local/bin/r-ui watchdog-loop >/dev/null 2>&1'
+        mkdir -p /etc/crontabs || return 1
+    else
+        cron_file="/etc/cron.d/r-ui-xray-watchdog"
+        cron_line='* * * * * root /usr/local/bin/r-ui watchdog-loop >/dev/null 2>&1'
+        mkdir -p /etc/cron.d || return 1
+    fi
+    if [[ "$already_enabled" != "y" ]]; then
+        watchdog_cron_remove || return 1
+        {
+            printf '# r-ui Xray API health check loop\n'
+            printf '%s\n' "$cron_line"
+        } >> "$cron_file" || return 1
+        chmod 0644 "$cron_file" || return 1
+    fi
+
+    if [[ "$SERVICE_MANAGER" == "openrc" ]]; then
+        rc-update add crond default >/dev/null 2>&1 || return 1
+        rc-service crond start >/dev/null 2>&1 || rc-service crond status >/dev/null 2>&1 || return 1
+    elif [[ "$SERVICE_MANAGER" == "systemd" ]]; then
+        service_manager_command systemctl enable --now cron.service >/dev/null 2>&1 || return 1
+    else
+        service_manager_command update-rc.d cron defaults >/dev/null 2>&1 || return 1
+        service_manager_command service cron start >/dev/null 2>&1 || \
+            service_manager_command service cron status >/dev/null 2>&1 || return 1
+    fi
+    nohup /bin/sh -c 'exec 9>&-; exec /usr/local/bin/r-ui watchdog-loop' \
+        >/dev/null 2>&1 </dev/null &
+    if [[ "$already_enabled" == "y" ]]; then
+        print_info "Xray 50 秒健康检测已经启用，无需重复设置"
+    else
+        print_info "Xray 本机 API 每 50 秒健康检测已启用，重启后会自动运行"
+    fi
+}
+
+watchdog_enable() {
+    detect_platform || return 1
+    if watchdog_is_enabled; then
+        watchdog_install
+        return $?
+    fi
+    if [[ ! -x "$XRAY_BIN" ]]; then
+        print_error "尚未安装 Xray；请先执行安装或初始化"
+        return 1
+    fi
+    install_dependencies || return 1
+    mkdir -p "$CONFIG_DIR" "$LOG_DIR" || return 1
+    ensure_api_config || return 1
+    ensure_service_definition || return 1
+    if service_is_active && { [[ "$API_CONFIG_CHANGED" == "y" ]] || ! xray_api_check; }; then
+        service_restart || {
+            print_error "加载本机 API 配置失败；请检查 Xray 服务日志"
+            return 1
+        }
+    fi
+    config_test || return 1
+    install_manager_script || return 1
+    rm -f "$WATCHDOG_DISABLED_CONFIG" "$WATCHDOG_DISABLED_FILE"
+    if ! watchdog_install; then
+        : > "$WATCHDOG_DISABLED_CONFIG" || true
+        : > "$WATCHDOG_DISABLED_FILE" || true
+        watchdog_cron_remove
+        watchdog_loop_stop
+        print_error "50 秒健康检测启用失败，请检查 cron 服务状态"
+        return 1
+    fi
+}
+
+watchdog_disable() {
+    detect_platform || return 1
+    if ! watchdog_is_enabled && [[ ! -e "$WATCHDOG_LOOP_PID_FILE" ]]; then
+        print_info "Xray 50 秒健康检测当前未启用，无需取消"
+        return 0
+    fi
+    mkdir -p "$CONFIG_DIR" || return 1
+    : > "$WATCHDOG_DISABLED_CONFIG" || return 1
+    watchdog_cron_remove || {
+        watchdog_loop_stop
+        return 1
+    }
+    : > "$WATCHDOG_DISABLED_FILE" || true
+    watchdog_loop_stop
+    rm -f "$WATCHDOG_COOLDOWN_FILE"
+    print_info "Xray 50 秒健康检测已取消，重启后也不会自动运行"
 }
 
 install_manager_script() {
@@ -515,10 +846,100 @@ install_manager_script() {
 
 make_default_config() {
     mkdir -p "$CONFIG_DIR" "$LOG_DIR"
-    jq -n --arg error "$LOG_DIR/error.log" \
-        '{log:{access:"none",error:$error,loglevel:"warning"},inbounds:[],outbounds:[{protocol:"freedom",tag:"direct"}]}' \
+    jq -n --arg error "$LOG_DIR/error.log" --arg tag "$XRAY_API_TAG" \
+        --argjson port "$XRAY_API_DEFAULT_PORT" \
+        '{log:{access:"none",error:$error,loglevel:"warning"},
+          api:{tag:$tag,services:["StatsService"]},
+          inbounds:[{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"dokodemo-door",settings:{address:"127.0.0.1"}}],
+          outbounds:[{protocol:"freedom",tag:"direct"}],
+          routing:{rules:[{type:"field",inboundTag:[$tag],outboundTag:"api"}]}}' \
         > "$CONFIG_FILE"
     chmod 0600 "$CONFIG_FILE"
+}
+
+ensure_api_config() {
+    local candidate=""
+    local candidate_dir=""
+    local api_tag=""
+    local api_port=""
+    local inbound_count=0
+    local inbound_protocol=""
+    local api_rule=''
+    local port=0
+
+    API_CONFIG_CHANGED="n"
+    [[ -f "$CONFIG_FILE" ]] || make_default_config
+    api_tag=$(jq -r '.api.tag // "r-ui-api"' "$CONFIG_FILE") || return 1
+    [[ -n "$api_tag" && "$api_tag" != "null" ]] || api_tag="r-ui-api"
+    inbound_count=$(jq --arg tag "$api_tag" '[.inbounds[]? | select(.tag == $tag)] | length' "$CONFIG_FILE") || return 1
+    if (( inbound_count > 1 )); then
+        print_error "配置中存在多个 Xray API 入站标签 $api_tag；请先修正配置"
+        return 1
+    fi
+    if (( inbound_count == 1 )); then
+        inbound_protocol=$(jq -r --arg tag "$api_tag" '.inbounds[] | select(.tag == $tag) | .protocol' "$CONFIG_FILE")
+        api_port=$(jq -r --arg tag "$api_tag" '.inbounds[] | select(.tag == $tag) | .port' "$CONFIG_FILE")
+        if [[ "$inbound_protocol" != "dokodemo-door" || ! "$api_port" =~ ^[0-9]+$ ]] || \
+            (( api_port < 1 || api_port > 65535 )); then
+            print_error "Xray API 入站 $api_tag 必须是有效端口的 dokodemo-door"
+            return 1
+        fi
+    else
+        for ((port = XRAY_API_DEFAULT_PORT; port <= XRAY_API_DEFAULT_PORT + 100; port++)); do
+            if ! jq -e --argjson port "$port" \
+                '[.inbounds[]? | select((.port | tostring) == ($port | tostring))] | length > 0' \
+                "$CONFIG_FILE" >/dev/null; then
+                api_port="$port"
+                break
+            fi
+        done
+        if [[ -z "$api_port" ]]; then
+            print_error "无法为 Xray 本机 API 找到空闲端口（$XRAY_API_DEFAULT_PORT-$((XRAY_API_DEFAULT_PORT + 100))）"
+            return 1
+        fi
+    fi
+
+    api_rule=$(jq -cn --arg tag "$api_tag" '{type:"field",inboundTag:[$tag],outboundTag:"api"}')
+    candidate_dir=$(mktemp -d "$CONFIG_DIR/.api-config.XXXXXX") || return 1
+    candidate="$candidate_dir/config.json"
+    if ! jq --arg tag "$api_tag" --argjson port "$api_port" --argjson rule "$api_rule" '
+        .inbounds = (.inbounds // [])
+        | .api = ((.api // {})
+            | .tag = $tag
+            | .services = (((if (.services | type) == "array" then .services else [] end) + ["StatsService"]) | unique))
+        | if any(.inbounds[]?; .tag == $tag) then
+            .inbounds |= map(if .tag == $tag then
+                .listen = "127.0.0.1"
+                | .settings = (if (.settings | type) == "object" then .settings else {} end)
+                | .settings.address = "127.0.0.1"
+            else . end)
+          else
+            .inbounds += [{tag:$tag,listen:"127.0.0.1",port:$port,protocol:"dokodemo-door",settings:{address:"127.0.0.1"}}]
+          end
+        | .routing = ((.routing // {}) as $routing
+            | $routing + {rules:([$rule] + [($routing.rules // [])[] |
+                select((.outboundTag != "api") or (((.inboundTag // []) | index($tag)) == null))])})
+    ' "$CONFIG_FILE" > "$candidate"; then
+        rm -rf "$candidate_dir"
+        print_error "启用 Xray 本机 API 配置失败"
+        return 1
+    fi
+
+    if ! config_validate_file "$candidate"; then
+        rm -rf "$candidate_dir"
+        print_error "启用 Xray 本机 API 后配置校验失败；现有配置未修改"
+        return 1
+    fi
+    if ! cp -p "$CONFIG_FILE" "$CONFIG_FILE.backup.$(date +%Y%m%d%H%M%S)" || \
+        ! chmod 0600 "$candidate" || ! mv -f "$candidate" "$CONFIG_FILE"; then
+        rm -rf "$candidate_dir"
+        print_error "保存 Xray 本机 API 配置失败"
+        return 1
+    fi
+    rm -rf "$candidate_dir"
+    XRAY_API_TAG="$api_tag"
+    API_CONFIG_CHANGED="y"
+    print_info "Xray 本机 Stats API 已配置为 127.0.0.1:$api_port"
 }
 
 config_validate_file() {
@@ -634,17 +1055,79 @@ url_encode() {
 }
 
 acquire_lock() {
+    local quiet=""
+    local operation=""
+    local owner_pid=""
+    local owner_start=""
+    local owner_operation=""
+    local actual_start=""
+    local owner_tmp=""
+
+    if [[ "$1" == "quiet" ]]; then
+        quiet="y"
+        operation="$2"
+    else
+        operation="$1"
+    fi
+
     if ! command -v flock >/dev/null 2>&1; then
-        print_warn "未找到 flock，本次操作无法串行化"
-        return 0
+        [[ "$quiet" == "y" ]] || print_error "未找到 flock，无法串行化服务操作"
+        return 1
     fi
     mkdir -p /run/lock || return 1
     exec 9>"$LOCK_FILE" || return 1
     if ! flock -n 9; then
-        print_error "另一个独立 Xray 管理操作正在执行"
-        return 1
+        if [[ "$operation" != "watchdog" ]] && \
+            read -r owner_pid owner_start owner_operation < "$LOCK_OWNER_FILE" 2>/dev/null && \
+            [[ "$owner_operation" == "watchdog" ]]; then
+            actual_start=$(process_start_time "$owner_pid" 2>/dev/null || true)
+            if [[ "$actual_start" == "$owner_start" ]]; then
+                kill -TERM -- "-$owner_pid" 2>/dev/null || kill -TERM "$owner_pid" 2>/dev/null || true
+                if ! flock -w 1 9; then
+                    kill -KILL -- "-$owner_pid" 2>/dev/null || kill -KILL "$owner_pid" 2>/dev/null || true
+                    flock -w 1 9 || {
+                        exec 9>&-
+                        print_error "已强制中止 Xray 自动恢复，但 2 秒内未能取得维护锁"
+                        return 1
+                    }
+                fi
+            else
+                exec 9>&-
+                [[ "$quiet" == "y" ]] || print_error "另一个独立 Xray 管理操作正在执行"
+                return 1
+            fi
+        else
+            exec 9>&-
+            [[ "$quiet" == "y" ]] || print_error "另一个独立 Xray 管理操作正在执行"
+            return 1
+        fi
     fi
     LOCK_ACQUIRED="y"
+    owner_tmp="$LOCK_OWNER_FILE.$BASHPID"
+    if ! printf '%s %s %s\n' "$BASHPID" "$(process_start_time "$BASHPID")" "$operation" > "$owner_tmp" || \
+        ! mv -f "$owner_tmp" "$LOCK_OWNER_FILE"; then
+        rm -f "$owner_tmp"
+        flock -u 9 || true
+        exec 9>&-
+        LOCK_ACQUIRED="n"
+        print_error "无法记录维护锁持有者，操作已取消"
+        return 1
+    fi
+}
+
+release_lock() {
+    if [[ "$LOCK_ACQUIRED" == "y" ]]; then
+        local owner_pid=""
+        local owner_start=""
+        local owner_operation=""
+        read -r owner_pid owner_start owner_operation < "$LOCK_OWNER_FILE" 2>/dev/null || true
+        if [[ "$owner_pid" == "$BASHPID" ]]; then
+            rm -f "$LOCK_OWNER_FILE"
+        fi
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+        LOCK_ACQUIRED="n"
+    fi
 }
 
 commit_config_file() {
@@ -1498,15 +1981,19 @@ add_inbound() {
 }
 
 list_inbounds() {
+    local api_tag=""
+
     if [[ ! -f "$CONFIG_FILE" ]]; then
         print_warn "配置文件不存在"
         return 1
     fi
-    jq -r '
-        if (.inbounds | length) == 0 then
+    api_tag=$(jq -r '.api.tag // "r-ui-api"' "$CONFIG_FILE") || return 1
+    jq -r --arg api_tag "$api_tag" '
+        [.inbounds[]? | select(.tag != $api_tag)] as $entries |
+        if ($entries | length) == 0 then
             "当前没有入站配置"
         else
-            .inbounds | to_entries[] |
+            $entries | to_entries[] |
             "\(.key + 1). \(.value.tag // "untagged") | \(.value.protocol) | \(.value.listen // "0.0.0.0"):\(.value.port) | \(.value.streamSettings.network // "tcp") / \(.value.streamSettings.security // "none")"
         end
     ' "$CONFIG_FILE"
@@ -1515,6 +2002,8 @@ list_inbounds() {
 delete_inbound() {
     local count=0
     local index=""
+    local actual_index=""
+    local api_tag=""
     local candidate=""
 
     [[ -f "$CONFIG_FILE" ]] || {
@@ -1522,7 +2011,8 @@ delete_inbound() {
         return 1
     }
     list_inbounds || return 1
-    count=$(jq '.inbounds | length' "$CONFIG_FILE")
+    api_tag=$(jq -r '.api.tag // "r-ui-api"' "$CONFIG_FILE") || return 1
+    count=$(jq --arg api_tag "$api_tag" '[.inbounds[]? | select(.tag != $api_tag)] | length' "$CONFIG_FILE")
     (( count > 0 )) || return 0
     read_prompt -r -p "输入要删除的编号 [1-$count]: " index || return 1
     if [[ ! "$index" =~ ^[0-9]+$ ]]; then
@@ -1544,8 +2034,10 @@ delete_inbound() {
         [[ "$PROMPT_ERROR" == "1" ]] && return 1
         return 0
     fi
+    actual_index=$(jq -er --argjson index "$index" --arg api_tag "$api_tag" \
+        '[.inbounds | to_entries[] | select(.value.tag != $api_tag)] | .[$index - 1].key' "$CONFIG_FILE") || return 1
     candidate=$(mktemp "$CONFIG_DIR/config.XXXXXX") || return 1
-    if ! jq --argjson index "$index" 'del(.inbounds[$index - 1])' "$CONFIG_FILE" > "$candidate"; then
+    if ! jq --argjson index "$actual_index" 'del(.inbounds[$index])' "$CONFIG_FILE" > "$candidate"; then
         rm -f "$candidate"
         return 1
     fi
@@ -1578,12 +2070,16 @@ configure_service() {
         [[ "$was_active" == "y" ]] && service_start
         return 1
     }
+    ensure_api_config || {
+        [[ "$was_active" == "y" ]] && service_start
+        return 1
+    }
     if ! config_test; then
         print_error "当前配置未通过 Xray 校验；没有启动服务"
         [[ "$was_active" == "y" ]] && service_start
         return 1
     fi
-    if [[ "$(jq '.inbounds | length' "$CONFIG_FILE")" == "0" ]]; then
+    if [[ "$(jq --arg tag "$XRAY_API_TAG" '[.inbounds[]? | select(.tag != $tag)] | length' "$CONFIG_FILE")" == "0" ]]; then
         if prompt_yesno "当前没有入站配置，现在运行交互式配置吗？" "y"; then
             if ! add_inbound; then
                 [[ "$was_active" == "y" ]] && service_start
@@ -1600,6 +2096,10 @@ configure_service() {
     install_manager_script || return 1
     service_start || {
         print_error "服务启动失败；请执行 logs 查看错误"
+        return 1
+    }
+    watchdog_install || {
+        print_error "Xray 已启动，但每 50 秒 API 健康检测未能配置"
         return 1
     }
     print_info "Xray 服务已启动并设置为开机启动"
@@ -1625,17 +2125,26 @@ update_xray() {
         [[ "$was_active" == "y" ]] && service_start
         return 1
     }
+    ensure_api_config || {
+        [[ "$was_active" == "y" ]] && service_start
+        return 1
+    }
     if ! config_test; then
         print_error "新版本配置校验失败；请检查配置和日志"
         [[ "$was_active" == "y" ]] && service_start
         return 1
     fi
+    install_manager_script || return 1
     if [[ "$was_active" == "y" ]]; then
         service_start || {
             print_error "Xray 更新完成，但服务启动失败"
             return 1
         }
     fi
+    watchdog_install || {
+        print_error "Xray 已更新，但每 50 秒 API 健康检测未能配置"
+        return 1
+    }
     print_info "Xray 已更新到最新版"
 }
 
@@ -1651,7 +2160,15 @@ uninstall_service() {
         print_error "停止服务失败；为避免留下孤立进程，已中止卸载"
         return 1
     fi
-    service_disable >/dev/null 2>&1 || true
+    service_disable || {
+        print_error "取消 Xray 开机启动失败；已中止卸载"
+        return 1
+    }
+    watchdog_disable || {
+        print_error "取消 Xray 状态检测失败；已中止卸载"
+        return 1
+    }
+    rm -f "$WATCHDOG_PAUSED_FILE" "$WATCHDOG_DISABLED_FILE" "$WATCHDOG_COOLDOWN_FILE" "$LOCK_OWNER_FILE"
     case "$SERVICE_MANAGER" in
         systemd)
             rm -f "/etc/systemd/system/$SERVICE_NAME.service"
@@ -1692,43 +2209,48 @@ run_menu() {
         printf ' 11. 查看最近日志\n'
         printf ' 12. 设置开机启动\n'
         printf ' 13. 取消开机启动\n'
-        printf ' 14. 卸载\n'
-        read_prompt -r -p "请输入选项 [0-14]: " choice || return 1
+        printf ' 14. 启用 Xray 状态检测\n'
+        printf ' 15. 取消 Xray 状态检测\n'
+        printf ' 16. 卸载\n'
+        read_prompt -r -p "请输入选项 [0-16]: " choice || return 1
         case "$choice" in
             0) return 0 ;;
-            1) configure_service ;;
-            2) detect_platform && add_inbound ;;
+            1) acquire_lock menu && configure_service ;;
+            2) acquire_lock menu && detect_platform && add_inbound ;;
             3) list_inbounds ;;
-            4) detect_platform && delete_inbound ;;
+            4) acquire_lock menu && detect_platform && delete_inbound ;;
             5) config_test ;;
-            6) update_xray ;;
-            7) detect_platform && service_start ;;
-            8) detect_platform && service_stop ;;
-            9) detect_platform && service_restart ;;
+            6) acquire_lock menu && update_xray ;;
+            7) acquire_lock menu && detect_platform && service_start ;;
+            8) acquire_lock menu && detect_platform && service_stop ;;
+            9) acquire_lock menu && detect_platform && service_restart ;;
             10) detect_platform && service_status ;;
             11) detect_platform && service_logs ;;
-            12) detect_platform && service_enable ;;
-            13) detect_platform && service_disable ;;
-            14) uninstall_service ;;
+            12) acquire_lock menu && detect_platform && service_enable ;;
+            13) acquire_lock menu && detect_platform && service_disable ;;
+            14) acquire_lock menu && watchdog_enable ;;
+            15) acquire_lock menu && watchdog_disable ;;
+            16) acquire_lock menu && uninstall_service ;;
             *) print_error "无效选项" ;;
         esac
+        release_lock
         read_prompt -r -p "按回车键继续..." _ || return 1
     done
 }
 
 main() {
     require_root
-    case "$1" in
-        list|test|check)
-            ;;
-        *)
-            acquire_lock || return 1
-            ;;
-    esac
     if [[ "$#" -eq 0 ]]; then
         run_menu
         return
     fi
+    case "$1" in
+        list|test|check|watchdog|watchdog-loop)
+            ;;
+        *)
+            acquire_lock "$1" || return 1
+            ;;
+    esac
     case "$1" in
         install) configure_service ;;
         add|configure) detect_platform && add_inbound ;;
@@ -1744,8 +2266,12 @@ main() {
         enable) detect_platform && service_enable ;;
         disable) detect_platform && service_disable ;;
         uninstall) uninstall_service ;;
+        watchdog-enable|monitor-enable) watchdog_enable ;;
+        watchdog-disable|monitor-disable) watchdog_disable ;;
+        watchdog) detect_platform && watchdog_check ;;
+        watchdog-loop) watchdog_loop ;;
         *)
-            printf '用法：%s [install|add|list|delete|test|update|start|stop|restart|status|logs|enable|disable|uninstall]\n' "$0"
+            printf '用法：%s [install|add|list|delete|test|update|start|stop|restart|status|logs|enable|disable|watchdog-enable|watchdog-disable|uninstall]\n' "$0"
             return 2
             ;;
     esac
