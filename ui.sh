@@ -788,15 +788,16 @@ update_menu_locked() {
             -e '/Xray API health check every 5 minutes/d' \
             -e '/Xray API health check every 50 seconds/d' \
             -e '/Xray API 每 50 秒健康检测/d' \
+            -e '/Xray API 每 40 秒健康检测/d' \
             "${cron_file}"
         if [[ "${distro}" == "alpine" ]]; then
             {
-                echo "# Xray API 每 50 秒健康检测"
+                echo "# Xray API 每 40 秒健康检测"
                 echo "* * * * * /usr/bin/x-ui watchdog-loop >/dev/null 2>&1"
             } >> "${cron_file}"
         else
             {
-                echo "# Xray API 每 50 秒健康检测"
+                echo "# Xray API 每 40 秒健康检测"
                 echo "* * * * * root /usr/bin/x-ui watchdog-loop >/dev/null 2>&1"
             } >> "${cron_file}"
         fi
@@ -862,6 +863,7 @@ uninstall_locked() {
           sed -i '/Xray API health check every 5 minutes/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Xray API health check every 50 seconds/d' /etc/crontabs/root 2>/dev/null || true
           sed -i '/Xray API 每 50 秒健康检测/d' /etc/crontabs/root 2>/dev/null || true
+          sed -i '/Xray API 每 40 秒健康检测/d' /etc/crontabs/root 2>/dev/null || true
       else
           rm -f /etc/cron.d/x-ui
       fi
@@ -1691,7 +1693,7 @@ watchdog_loop() {
     local log_tmp=""
     local output=""
     local status=0
-    local interval=50
+    local interval=40
     local loop_lock_fd=""
     local flock_bin=""
     local loop_start=""
@@ -2249,7 +2251,7 @@ show_usage() {
     echo -e "x-ui restart-xray - 重启xray服务"
     echo -e "x-ui check-xray [api-address] - 手动检测xray状态"
     echo -e "x-ui watchdog-xray [api-address] - 检测并自动恢复xray"
-    echo -e "x-ui watchdog-loop [api-address] - 每50秒检测并自动恢复xray"
+    echo -e "x-ui watchdog-loop [api-address] - 每40秒检测并自动恢复xray"
     echo -e "x-ui status       - 查看服务状态"
     echo -e "x-ui settings     - 查看服务配置"
     echo -e "x-ui enable       - 设置开机启动"

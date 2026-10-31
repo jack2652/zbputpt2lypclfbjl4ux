@@ -17,7 +17,9 @@ WATCHDOG_PAUSED_FILE="/run/xray-standalone-watchdog.paused"
 WATCHDOG_COOLDOWN_FILE="/run/xray-standalone-watchdog.cooldown"
 WATCHDOG_DISABLED_FILE="/run/xray-standalone-watchdog.disabled"
 WATCHDOG_DISABLED_CONFIG="/etc/xray-standalone/watchdog.disabled"
+WATCHDOG_INTERVAL_CONFIG="/etc/xray-standalone/watchdog.interval"
 WATCHDOG_LOG_FILE="/var/log/xray-standalone/watchdog.log"
+WATCHDOG_DEFAULT_INTERVAL=40
 XRAY_API_DEFAULT_PORT=62789
 XRAY_API_TAG="r-ui-api"
 API_CONFIG_CHANGED="n"
@@ -102,7 +104,7 @@ detect_platform() {
 
 install_dependencies() {
     if [[ "$DISTRO" == "alpine" ]]; then
-        apk add --no-cache bash ca-certificates curl jq unzip coreutils openssl util-linux util-linux-misc
+        apk add --no-cache bash ca-certificates curl jq unzip coreutils openssl util-linux util-linux-misc cronie
     else
         export DEBIAN_FRONTEND=noninteractive
         apt-get update || return 1
@@ -640,6 +642,7 @@ watchdog_loop() {
     local loop_start=""
     local output=""
     local status=0
+    local interval=""
 
     [[ -e "$WATCHDOG_DISABLED_FILE" || -e "$WATCHDOG_DISABLED_CONFIG" ]] && return 0
     command -v flock >/dev/null 2>&1 || {
@@ -662,13 +665,58 @@ watchdog_loop() {
         output=$( (exec 8>&-; setsid "$MANAGER_BIN" watchdog) 2>&1)
         status=$?
         watchdog_append_log "$output" || true
-        sleep 50 &
+        interval=$(watchdog_interval_read)
+        sleep "$interval" &
         WATCHDOG_LOOP_SLEEP_PID=$!
         wait "$WATCHDOG_LOOP_SLEEP_PID" || true
         WATCHDOG_LOOP_SLEEP_PID=""
     done
     rm -f "$WATCHDOG_LOOP_PID_FILE"
     return "$status"
+}
+
+watchdog_interval_valid() {
+    local interval="$1"
+
+    [[ "$interval" =~ ^[1-9][0-9]*$ && ${#interval} -le 5 ]] || return 1
+    (( 10#$interval <= 86400 ))
+}
+
+watchdog_interval_read() {
+    local interval=""
+
+    interval=$(cat "$WATCHDOG_INTERVAL_CONFIG" 2>/dev/null || true)
+    if watchdog_interval_valid "$interval"; then
+        printf '%s\n' "$interval"
+    else
+        printf '%s\n' "$WATCHDOG_DEFAULT_INTERVAL"
+    fi
+}
+
+watchdog_interval_save() {
+    local interval="$1"
+    local temporary=""
+
+    watchdog_interval_valid "$interval" || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
+    temporary=$(mktemp "$CONFIG_DIR/.watchdog-interval.XXXXXX") || return 1
+    if ! printf '%s\n' "$interval" > "$temporary" || ! chmod 0644 "$temporary" || \
+        ! mv -f "$temporary" "$WATCHDOG_INTERVAL_CONFIG"; then
+        rm -f "$temporary"
+        return 1
+    fi
+}
+
+watchdog_prompt_interval() {
+    local interval=""
+
+    read_prompt -r -p "请输入检测间隔秒数 [默认 ${WATCHDOG_DEFAULT_INTERVAL}]: " interval || return 1
+    [[ -n "$interval" ]] || interval="$WATCHDOG_DEFAULT_INTERVAL"
+    if ! watchdog_interval_valid "$interval"; then
+        print_error "检测间隔必须是 1-86400 的正整数"
+        return 1
+    fi
+    WATCHDOG_SELECTED_INTERVAL="$interval"
 }
 
 watchdog_loop_stop() {
@@ -720,22 +768,41 @@ watchdog_install() {
     local cron_file=""
     local cron_line=""
     local already_enabled="n"
+    local requested_interval="${1:-}"
+    local interval=""
+    local previous_interval=""
+    local interval_changed="n"
 
     [[ -x "$MANAGER_BIN" ]] || {
         print_error "管理命令 $MANAGER_BIN 不存在，无法启动 Xray 健康检测"
         return 1
     }
     if [[ -e "$WATCHDOG_DISABLED_CONFIG" ]]; then
-        print_info "Xray 50 秒健康检测已手动关闭，保持关闭状态"
+        print_info "Xray 健康检测已手动关闭，保持关闭状态"
         return 0
     fi
+    previous_interval=$(watchdog_interval_read)
+    if [[ -n "$requested_interval" ]]; then
+        watchdog_interval_valid "$requested_interval" || {
+            print_error "检测间隔必须是 1-86400 的正整数"
+            return 1
+        }
+        interval="$requested_interval"
+        [[ "$previous_interval" == "$interval" ]] || interval_changed="y"
+    else
+        interval="$previous_interval"
+    fi
+    watchdog_interval_save "$interval" || {
+        print_error "保存 Xray 健康检测间隔失败"
+        return 1
+    }
     rm -f "$WATCHDOG_DISABLED_FILE"
     if watchdog_is_enabled; then
         already_enabled="y"
     fi
     if [[ "$DISTRO" == "alpine" ]]; then
         command -v crond >/dev/null 2>&1 || {
-            print_error "未找到 crond，无法设置 Xray 每 50 秒 API 检测"
+            print_error "未找到 crond，无法设置 Xray API 健康检测"
             return 1
         }
         cron_file="/etc/crontabs/root"
@@ -765,19 +832,29 @@ watchdog_install() {
         service_manager_command service cron start >/dev/null 2>&1 || \
             service_manager_command service cron status >/dev/null 2>&1 || return 1
     fi
+    if [[ "$already_enabled" == "y" && "$interval_changed" == "y" ]]; then
+        watchdog_loop_stop
+    fi
     nohup /bin/sh -c 'exec 9>&-; exec /usr/local/bin/r-ui watchdog-loop' \
         >/dev/null 2>&1 </dev/null &
     if [[ "$already_enabled" == "y" ]]; then
-        print_info "Xray 50 秒健康检测已经启用，无需重复设置"
+        if [[ "$interval_changed" == "y" ]]; then
+            print_info "Xray 本机 API 健康检测间隔已更新为 ${interval} 秒"
+        else
+            print_info "Xray ${interval} 秒健康检测已经启用，无需重复设置"
+        fi
     else
-        print_info "Xray 本机 API 每 50 秒健康检测已启用，重启后会自动运行"
+        print_info "Xray 本机 API 每 ${interval} 秒健康检测已启用，重启后会自动运行"
     fi
 }
 
 watchdog_enable() {
     detect_platform || return 1
+    if ! watchdog_prompt_interval; then
+        return 1
+    fi
     if watchdog_is_enabled; then
-        watchdog_install
+        watchdog_install "$WATCHDOG_SELECTED_INTERVAL"
         return $?
     fi
     if [[ ! -x "$XRAY_BIN" ]]; then
@@ -797,12 +874,12 @@ watchdog_enable() {
     config_test || return 1
     install_manager_script || return 1
     rm -f "$WATCHDOG_DISABLED_CONFIG" "$WATCHDOG_DISABLED_FILE"
-    if ! watchdog_install; then
+    if ! watchdog_install "$WATCHDOG_SELECTED_INTERVAL"; then
         : > "$WATCHDOG_DISABLED_CONFIG" || true
         : > "$WATCHDOG_DISABLED_FILE" || true
         watchdog_cron_remove
         watchdog_loop_stop
-        print_error "50 秒健康检测启用失败，请检查 cron 服务状态"
+        print_error "${WATCHDOG_SELECTED_INTERVAL} 秒健康检测启用失败，请检查 cron 服务状态"
         return 1
     fi
 }
@@ -810,7 +887,7 @@ watchdog_enable() {
 watchdog_disable() {
     detect_platform || return 1
     if ! watchdog_is_enabled && [[ ! -e "$WATCHDOG_LOOP_PID_FILE" ]]; then
-        print_info "Xray 50 秒健康检测当前未启用，无需取消"
+        print_info "Xray API 健康检测当前未启用，无需取消"
         return 0
     fi
     mkdir -p "$CONFIG_DIR" || return 1
@@ -822,7 +899,7 @@ watchdog_disable() {
     : > "$WATCHDOG_DISABLED_FILE" || true
     watchdog_loop_stop
     rm -f "$WATCHDOG_COOLDOWN_FILE"
-    print_info "Xray 50 秒健康检测已取消，重启后也不会自动运行"
+    print_info "Xray API 健康检测已取消，重启后也不会自动运行"
 }
 
 install_manager_script() {
@@ -2098,8 +2175,8 @@ configure_service() {
         print_error "服务启动失败；请执行 logs 查看错误"
         return 1
     }
-    watchdog_install || {
-        print_error "Xray 已启动，但每 50 秒 API 健康检测未能配置"
+    watchdog_install "$WATCHDOG_DEFAULT_INTERVAL" || {
+        print_error "Xray 已启动，但每 40 秒 API 健康检测未能配置"
         return 1
     }
     print_info "Xray 服务已启动并设置为开机启动"
@@ -2142,7 +2219,7 @@ update_xray() {
         }
     fi
     watchdog_install || {
-        print_error "Xray 已更新，但每 50 秒 API 健康检测未能配置"
+        print_error "Xray 已更新，但 API 健康检测未能配置"
         return 1
     }
     print_info "Xray 已更新到最新版"
@@ -2239,6 +2316,8 @@ run_menu() {
 }
 
 main() {
+    local status=0
+
     require_root
     if [[ "$#" -eq 0 ]]; then
         run_menu
@@ -2252,29 +2331,31 @@ main() {
             ;;
     esac
     case "$1" in
-        install) configure_service ;;
-        add|configure) detect_platform && add_inbound ;;
-        list) list_inbounds ;;
-        delete) detect_platform && delete_inbound ;;
-        test|check) config_test ;;
-        update) update_xray ;;
-        start) detect_platform && service_start ;;
-        stop) detect_platform && service_stop ;;
-        restart) detect_platform && service_restart ;;
-        status) detect_platform && service_status ;;
-        logs) detect_platform && service_logs ;;
-        enable) detect_platform && service_enable ;;
-        disable) detect_platform && service_disable ;;
-        uninstall) uninstall_service ;;
-        watchdog-enable|monitor-enable) watchdog_enable ;;
-        watchdog-disable|monitor-disable) watchdog_disable ;;
-        watchdog) detect_platform && watchdog_check ;;
-        watchdog-loop) watchdog_loop ;;
+        install) configure_service; status=$? ;;
+        add|configure) detect_platform && add_inbound; status=$? ;;
+        list) list_inbounds; status=$? ;;
+        delete) detect_platform && delete_inbound; status=$? ;;
+        test|check) config_test; status=$? ;;
+        update) update_xray; status=$? ;;
+        start) detect_platform && service_start; status=$? ;;
+        stop) detect_platform && service_stop; status=$? ;;
+        restart) detect_platform && service_restart; status=$? ;;
+        status) detect_platform && service_status; status=$? ;;
+        logs) detect_platform && service_logs; status=$? ;;
+        enable) detect_platform && service_enable; status=$? ;;
+        disable) detect_platform && service_disable; status=$? ;;
+        uninstall) uninstall_service; status=$? ;;
+        watchdog-enable|monitor-enable) watchdog_enable; status=$? ;;
+        watchdog-disable|monitor-disable) watchdog_disable; status=$? ;;
+        watchdog) detect_platform && watchdog_check; status=$? ;;
+        watchdog-loop) watchdog_loop; status=$? ;;
         *)
             printf '用法：%s [install|add|list|delete|test|update|start|stop|restart|status|logs|enable|disable|watchdog-enable|watchdog-disable|uninstall]\n' "$0"
-            return 2
+            status=2
             ;;
     esac
+    release_lock
+    return "$status"
 }
 
 main "$@"

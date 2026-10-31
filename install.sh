@@ -425,7 +425,7 @@ setup_xray_watchdog() {
     local cron_line=""
     local log_file="/var/log/x-ui-xray-watchdog.log"
 
-    echo -e "${yellow}配置 Xray API 每 50 秒健康检测...${plain}"
+    echo -e "${yellow}配置 Xray API 每 40 秒健康检测...${plain}"
     if [[ "${distro}" == "alpine" ]]; then
         if ! command -v crond >/dev/null 2>&1; then
             echo -e "${yellow}未找到 crond，跳过 Xray API 定时检测${plain}"
@@ -453,9 +453,10 @@ setup_xray_watchdog() {
         sed -i '/Xray API health check every 5 minutes/d' "${cron_file}"
         sed -i '/Xray API health check every 50 seconds/d' "${cron_file}"
         sed -i '/Xray API 每 50 秒健康检测/d' "${cron_file}"
+        sed -i '/Xray API 每 40 秒健康检测/d' "${cron_file}"
     fi
     {
-        echo "# Xray API 每 50 秒健康检测"
+        echo "# Xray API 每 40 秒健康检测"
         echo "${cron_line}"
     } >> "${cron_file}"
     chmod 644 "${cron_file}"
@@ -477,7 +478,7 @@ setup_xray_watchdog() {
     nohup /bin/sh -c 'unset XUI_MAINTENANCE_LOCK_HELD; exec /usr/bin/x-ui watchdog-loop' \
         >/dev/null 2>&1 </dev/null &
 
-    echo -e "${green}Xray API 每 50 秒健康检测配置完成${plain}"
+    echo -e "${green}Xray API 每 40 秒健康检测配置完成${plain}"
 }
 
 install_x_ui() {
